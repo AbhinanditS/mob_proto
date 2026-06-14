@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: #0e0e0e;
+    color: #f0f0f0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+  }
+
+  #root {
+    overflow: hidden;
+  }
+
+  /* Contenteditable fields should never show the native focus ring —
+     all focus affordances are drawn with Motion. */
+  [contenteditable]:focus {
+    outline: none;
+  }
+
+  ::selection {
+    background: rgba(0, 0, 0, 0.12);
+  }
+}
