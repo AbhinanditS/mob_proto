@@ -1,0 +1,395 @@
+"use client";
+
+import React, { useState, useEffect, useRef, useMemo } from "react";
+import rawEmbeddings from "@/embeddings.json";
+
+interface ImageRecord {
+  id: string;
+  file: string;
+  thumb: string;
+  w: number;
+  h: number;
+  embedding: number[];
+}
+
+interface LaidOutItem extends ImageRecord {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export default function Home() {
+  const [mounted, setMounted] = useState(false);
+  const [queryId, setQueryId] = useState<string | null>(null);
+  const [history, setHistory] = useState<string[]>([]);
+  const [showHelp, setShowHelp] = useState(false);
+  const [dimensions, setDimensions] = useState({ w: 1200, h: 800 });
+
+  const helpRef = useRef<HTMLDivElement>(null);
+
+  // Parse items and cache their Float32Array embeddings
+  const items = useMemo(() => {
+    return (rawEmbeddings as ImageRecord[]).map(item => ({
+      ...item,
+      vec: new Float32Array(item.embedding)
+    }));
+  }, []);
+
+  // Map for fast O(1) retrieval by ID
+  const byId = useMemo(() => {
+    return new Map(items.map(item => [item.id, item]));
+  }, [items]);
+
+  // Set mounted and dimensions client-side, initialize seed query
+  useEffect(() => {
+    setMounted(true);
+
+    const handleResize = () => {
+      setDimensions({
+        w: window.innerWidth,
+        h: window.innerHeight
+      });
+    };
+
+    window.addEventListener("resize", handleResize);
+    handleResize();
+
+    // Determine initial seed image
+    if (items.length > 0) {
+      let initialId = "";
+      const hash = window.location.hash.substring(1);
+      if (hash && byId.has(hash)) {
+        initialId = hash;
+      } else {
+        // Pick a random image to seed the experience
+        const randomIndex = Math.floor(Math.random() * items.length);
+        initialId = items[randomIndex].id;
+      }
+      setQueryId(initialId);
+    }
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [items, byId]);
+
+  // Listen to hashchange events (native browser back/forward support)
+  useEffect(() => {
+    if (!mounted) return;
+
+    const handleHashChange = () => {
+      const hash = window.location.hash.substring(1);
+      if (hash && byId.has(hash) && hash !== queryId) {
+        setQueryId(hash);
+      }
+    };
+
+    window.addEventListener("hashchange", handleHashChange);
+    return () => {
+      window.removeEventListener("hashchange", handleHashChange);
+    };
+  }, [mounted, queryId, byId]);
+
+  // Close help overlay if clicked outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (showHelp && helpRef.current && !helpRef.current.contains(event.target as Node)) {
+        setShowHelp(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showHelp]);
+
+  // Brute-force Cosine Similarity (Dot Product over pre-normalized vectors)
+  const dot = (a: Float32Array, b: Float32Array) => {
+    let s = 0;
+    const len = a.length;
+    for (let i = 0; i < len; i++) s += a[i] * b[i];
+    return s;
+  };
+
+  // Neighborhood: get the top 60 nearest neighbors (query ID is first cell as s≈1)
+  const neighborhood = useMemo(() => {
+    if (!queryId || items.length === 0) return [];
+    const queryItem = byId.get(queryId);
+    if (!queryItem) return [];
+
+    const q = queryItem.vec;
+    return items
+      .map(it => ({ it, s: dot(q, it.vec) }))
+      .sort((a, b) => b.s - a.s)
+      .map(x => x.it);
+  }, [queryId, items, byId]);
+
+  // Layout geometry computation (Justified Grid)
+  const flatLaidOutItems = useMemo(() => {
+    if (neighborhood.length === 0) return [];
+
+    const containerW = dimensions.w;
+    const containerH = dimensions.h;
+    const targetH = Math.max(180, Math.min(320, containerH / 4.5));
+    const gap = 1;
+
+    const laidOut: LaidOutItem[] = [];
+    let currentTop = 0;
+    let currentRow: ImageRecord[] = [];
+    let currentRowWidth = 0;
+
+    for (let i = 0; i < neighborhood.length; i++) {
+      const item = neighborhood[i];
+      const aspect = item.w / item.h;
+      const itemW = aspect * targetH;
+      const additionalW = currentRow.length > 0 ? gap + itemW : itemW;
+
+      if (currentRowWidth + additionalW > containerW && currentRow.length > 0) {
+        // Committing this row: scale it down to exactly fit containerW
+        const numGaps = currentRow.length - 1;
+        const availableW = containerW - numGaps * gap;
+        const sumAspect = currentRow.reduce((sum, it) => sum + (it.w / it.h), 0);
+        const rowH = availableW / sumAspect;
+
+        let currentLeft = 0;
+        for (const rowItem of currentRow) {
+          const finalW = (rowItem.w / rowItem.h) * rowH;
+          laidOut.push({
+            ...rowItem,
+            left: currentLeft,
+            top: currentTop,
+            width: finalW,
+            height: rowH,
+          });
+          currentLeft += finalW + gap;
+        }
+
+        currentTop += rowH + gap;
+        currentRow = [item];
+        currentRowWidth = itemW;
+      } else {
+        currentRow.push(item);
+        currentRowWidth += additionalW;
+      }
+    }
+
+    // Justify the last row if there are remaining items
+    if (currentRow.length > 0) {
+      const numGaps = currentRow.length - 1;
+      const availableW = containerW - numGaps * gap;
+      const sumAspect = currentRow.reduce((sum, it) => sum + (it.w / it.h), 0);
+      const rowH = availableW / sumAspect;
+
+      let currentLeft = 0;
+      for (const rowItem of currentRow) {
+        const finalW = (rowItem.w / rowItem.h) * rowH;
+        laidOut.push({
+          ...rowItem,
+          left: currentLeft,
+          top: currentTop,
+          width: finalW,
+          height: rowH,
+        });
+        currentLeft += finalW + gap;
+      }
+    }
+
+    return laidOut;
+  }, [neighborhood, dimensions]);
+
+  // Left click (hop to neighbor)
+  const handleImageClick = (id: string) => {
+    if (queryId && queryId !== id) {
+      setHistory(prev => [...prev, queryId]);
+      setQueryId(id);
+      window.location.hash = id;
+    }
+  };
+
+  // Right click (open original image in new tab)
+  const handleImageRightClick = (e: React.MouseEvent, fileUrl: string) => {
+    e.preventDefault();
+    window.open(fileUrl, "_blank");
+  };
+
+  // Navigation handlers
+  const handleBack = () => {
+    if (history.length > 0) {
+      const nextHistory = [...history];
+      const prevId = nextHistory.pop()!;
+      setHistory(nextHistory);
+      setQueryId(prevId);
+      window.location.hash = prevId;
+    }
+  };
+
+  const handleHome = () => {
+    if (items.length > 0) {
+      const randomIndex = Math.floor(Math.random() * items.length);
+      const randomId = items[randomIndex].id;
+      if (queryId) {
+        setHistory(prev => [...prev, queryId]);
+      }
+      setQueryId(randomId);
+      window.location.hash = randomId;
+    }
+  };
+
+  if (!mounted) {
+    return <div className="w-screen h-screen bg-black" />;
+  }
+
+  // Developer/Empty state warning
+  if (items.length === 0) {
+    return (
+      <div className="w-screen h-screen bg-[#050505] flex flex-col items-center justify-center p-8 text-center">
+        <div className="max-w-md bg-neutral-900 border border-neutral-800 p-8 rounded-2xl shadow-2xl backdrop-blur-md">
+          <h2 className="text-xl font-semibold mb-4 text-white">Welcome to River</h2>
+          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
+            The dataset is currently empty. Drop your image files (JPEG, PNG, WebP) into:
+          </p>
+          <code className="block bg-black text-emerald-400 p-3 rounded-lg text-xs font-mono mb-6 border border-neutral-800 text-left select-all">
+            public/images/
+          </code>
+          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
+            Then run the precomputation script to generate embeddings and thumbnails:
+          </p>
+          <code className="block bg-black text-emerald-400 p-3 rounded-lg text-xs font-mono mb-6 border border-neutral-800 text-left select-all">
+            npm run precompute
+          </code>
+          <p className="text-neutral-500 text-xs">
+            Once run, the embeddings will be saved to <span className="font-mono text-neutral-400">src/embeddings.json</span> and the app will refresh.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid-container">
+      {/* Floating control overlay */}
+      <div className="controls-panel">
+        <button
+          className="control-btn"
+          onClick={handleBack}
+          disabled={history.length === 0}
+          title="Back to previous query"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="19" y1="12" x2="5" y2="12"></line>
+            <polyline points="12 19 5 12 12 5"></polyline>
+          </svg>
+          Back
+        </button>
+        <button
+          className="control-btn"
+          onClick={handleHome}
+          title="Jump to random seed image"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+            <polyline points="9 22 9 12 15 12 15 22"></polyline>
+          </svg>
+          Home
+        </button>
+        <div className="divider"></div>
+        <button
+          className="control-btn help-modal-trigger"
+          onClick={() => setShowHelp(prev => !prev)}
+          title="Show instructions"
+        >
+          ?
+        </button>
+
+        {/* Status display (items processed) */}
+        <span className="status-info">
+          {items.length} items
+        </span>
+
+        {/* Help popover */}
+        <div ref={helpRef} className={`help-tooltip ${showHelp ? "visible" : ""}`}>
+          <h3>River Exploration</h3>
+          <p>This is a lateral exploration tool for your local image library, connected via SigLIP ViT-B/16 (384px) embeddings.</p>
+          <ul>
+            <li><span className="key-hint">Left-Click</span> an image to refill the grid with its visually nearest neighbors.</li>
+            <li><span className="key-hint">Right-Click</span> an image to open the high-res original in a new tab.</li>
+            <li>Use the control buttons above to navigate your journey.</li>
+          </ul>
+          <p className="text-neutral-500 text-xs">Press anywhere outside to dismiss this panel.</p>
+        </div>
+      </div>
+
+      {/* Main Justified Grid of absolute positioned elements */}
+      {flatLaidOutItems.map(item => (
+        <ImageCard
+          key={item.id}
+          item={item}
+          onClick={() => handleImageClick(item.id)}
+          onRightClick={(e) => handleImageRightClick(e, item.file)}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface ImageCardProps {
+  item: LaidOutItem;
+  onClick: () => void;
+  onRightClick: (e: React.MouseEvent) => void;
+}
+
+const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRightClick }) => {
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const img = new Image();
+    img.src = item.thumb;
+
+    if (img.complete) {
+      setLoaded(true);
+    } else {
+      img.decode()
+        .then(() => {
+          if (active) {
+            setLoaded(true);
+          }
+        })
+        .catch(() => {
+          img.onload = () => {
+            if (active) {
+              setLoaded(true);
+            }
+          };
+        });
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [item.thumb]);
+
+  return (
+    <div
+      className="image-item"
+      style={{
+        left: `${item.left}px`,
+        top: `${item.top}px`,
+        width: `${item.width}px`,
+        height: `${item.height}px`,
+      }}
+      onClick={onClick}
+      onContextMenu={onRightClick}
+    >
+      <img
+        src={item.thumb}
+        alt=""
+        className={`image-element ${loaded ? "loaded" : ""}`}
+        draggable={false}
+      />
+    </div>
+  );
+});
+
+ImageCard.displayName = "ImageCard";
