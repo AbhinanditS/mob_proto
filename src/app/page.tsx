@@ -40,6 +40,9 @@ export default function Home() {
   // Cache the lazily-loaded tokenizer + text model so only the first search
   // pays the load/download cost.
   const textModelRef = useRef<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel } | null>(null);
+  // Monotonic token to invalidate in-flight searches when the user clears the
+  // box, submits a new query, or clicks away before the previous one resolves.
+  const searchSeqRef = useRef(0);
 
   // Parse items and cache their Float32Array embeddings
   const items = useMemo(() => {
@@ -222,7 +225,8 @@ export default function Home() {
   // Left click (hop to neighbor). Clicking a result hands control back to
   // image-to-image visual exploration, exiting text-search mode.
   const handleImageClick = (id: string) => {
-    if (textVec) {
+    if (textVec || searchStatus) {
+      searchSeqRef.current++;
       setTextVec(null);
       setSearchTerm("");
       setSearchStatus(null);
@@ -238,6 +242,9 @@ export default function Home() {
   // it to drive the ranking. The image vectors already live in this same space.
   const runTextSearch = async (text: string) => {
     const query = text.trim();
+    // Each call gets a token; later calls (or clearing) bump it, so a slow
+    // request that resolves after the user has moved on becomes a no-op.
+    const seq = ++searchSeqRef.current;
     if (!query) {
       setTextVec(null);
       setSearchStatus(null);
@@ -256,11 +263,14 @@ export default function Home() {
         cached = { tokenizer, model };
         textModelRef.current = cached;
       }
+      if (searchSeqRef.current !== seq) return;
 
       setSearchStatus("Searching…");
       // SigLIP expects fixed-length, padded (max_length 64) token sequences.
       const inputs = cached.tokenizer(query, { padding: "max_length", truncation: true });
       const { pooler_output } = await cached.model(inputs);
+      if (searchSeqRef.current !== seq) return;
+
       const v = Array.from(pooler_output.data as Float32Array);
       // L2-normalize so dot product equals cosine similarity, matching how the
       // image vectors are normalized in scripts/precompute.ts.
@@ -271,7 +281,7 @@ export default function Home() {
       setSearchStatus(null);
     } catch (err) {
       console.error("Text search failed:", err);
-      setSearchStatus("Search failed");
+      if (searchSeqRef.current === seq) setSearchStatus("Search failed");
     }
   };
 
@@ -283,6 +293,7 @@ export default function Home() {
   };
 
   const clearSearch = () => {
+    searchSeqRef.current++;
     setSearchTerm("");
     setTextVec(null);
     setSearchStatus(null);
