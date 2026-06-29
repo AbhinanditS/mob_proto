@@ -558,3 +558,157 @@ body, html {
   color: rgba(255, 255, 255, 0.35);
   flex-shrink: 0;
 }
+
+/* ===========================================================================
+   3D latent-space navigator
+   =========================================================================== */
+
+.navigator-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: #050505;
+  overflow: hidden;
+}
+
+.navigator-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none; /* let OrbitControls own drag/zoom gestures */
+}
+
+.navigator-close {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  z-index: 3;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(20, 20, 20, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+
+.navigator-close:hover {
+  background: rgba(40, 40, 40, 0.85);
+  color: #fff;
+  transform: scale(1.06);
+}
+
+.navigator-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+}
+
+.navigator-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.12);
+  border-top-color: rgba(255, 255, 255, 0.7);
+  animation: navigator-spin 0.8s linear infinite;
+}
+
+@keyframes navigator-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.navigator-hint {
+  position: absolute;
+  bottom: 26px;
+  left: 0;
+  width: 100%;
+  text-align: center;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.4);
+  pointer-events: none;
+  animation: navigator-fade-in 0.6s ease;
+}
+
+@keyframes navigator-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Horizontal neighbor strip — closest matches, in order, along the bottom. */
+.navigator-strip {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  padding: 14px 18px 18px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  background: linear-gradient(
+    to top,
+    rgba(5, 5, 5, 0.92) 0%,
+    rgba(5, 5, 5, 0.6) 60%,
+    rgba(5, 5, 5, 0) 100%
+  );
+  animation: navigator-strip-in 0.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes navigator-strip-in {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.navigator-strip-item {
+  flex: 0 0 auto;
+  height: 96px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #0a0a0a;
+  cursor: pointer;
+  scroll-snap-align: center;
+  opacity: 0.78;
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.18s ease, border-color 0.18s ease;
+}
+
+.navigator-strip-item:hover {
+  opacity: 1;
+  transform: translateY(-4px) scale(1.03);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.navigator-strip-item img {
+  display: block;
+  height: 100%;
+  width: auto;
+  object-fit: cover;
+}

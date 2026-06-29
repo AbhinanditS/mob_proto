@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef, useMemo } from "react";
 import type { PreTrainedTokenizer, PreTrainedModel } from "@huggingface/transformers";
 import rawEmbeddings from "@/embeddings.json";
 import Converge from "./Converge";
+import Navigator3D from "./Navigator3D";
 
 interface ImageRecord {
   id: string;
@@ -35,6 +36,9 @@ export default function Home() {
   // embeddings but never touches queryId/textVec/neighborhood, so the main
   // grid's geometry is frozen while it runs.
   const [convergeActive, setConvergeActive] = useState(false);
+  // 3D navigator: a self-contained WebGL overlay over the same embeddings. Like
+  // Converge, it never touches the main grid's queryId/textVec/neighborhood.
+  const [navigatorActive, setNavigatorActive] = useState(false);
 
   // Text content-search state
   const [searchTerm, setSearchTerm] = useState("");
@@ -401,6 +405,18 @@ export default function Home() {
           </svg>
           Converge
         </button>
+        <button
+          className="control-btn"
+          onClick={() => setNavigatorActive(true)}
+          title="Explore embeddings as a 3D latent-space cloud"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 2 21 7v10l-9 5-9-5V7z"></path>
+            <path d="M12 2v20"></path>
+            <path d="M21 7l-9 5-9-5"></path>
+          </svg>
+          Explore 3D
+        </button>
         <div className="divider"></div>
 
         {/* Content search: type words to find images by what they depict */}
@@ -472,6 +488,11 @@ export default function Home() {
       {/* Converge overlay — mounts on demand, leaves the grid untouched */}
       {convergeActive && (
         <Converge items={items} onExit={() => setConvergeActive(false)} />
+      )}
+
+      {/* 3D latent-space navigator — mounts on demand, leaves the grid untouched */}
+      {navigatorActive && (
+        <Navigator3D items={items} onExit={() => setNavigatorActive(false)} />
       )}
     </div>
   );

@@ -14,12 +14,15 @@
     "next": "^15.1.7",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "three": "^0.185.0",
+    "umap-js": "^1.4.0"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.185.0",
     "eslint": "^9",
     "eslint-config-next": "^15.1.7",
     "tsx": "^4.19.1",
