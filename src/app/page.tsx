@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import type { PreTrainedTokenizer, PreTrainedModel } from "@huggingface/transformers";
 import rawEmbeddings from "@/embeddings.json";
+import Converge from "./Converge";
 
 interface ImageRecord {
   id: string;
@@ -30,6 +31,10 @@ export default function Home() {
   const [history, setHistory] = useState<string[]>([]);
   const [showHelp, setShowHelp] = useState(false);
   const [dimensions, setDimensions] = useState({ w: 1200, h: 800 });
+  // Converge: a self-contained pairwise-choice overlay. It reads the same
+  // embeddings but never touches queryId/textVec/neighborhood, so the main
+  // grid's geometry is frozen while it runs.
+  const [convergeActive, setConvergeActive] = useState(false);
 
   // Text content-search state
   const [searchTerm, setSearchTerm] = useState("");
@@ -385,6 +390,17 @@ export default function Home() {
           </svg>
           Home
         </button>
+        <button
+          className="control-btn"
+          onClick={() => setConvergeActive(true)}
+          title="Converge: pick one aesthetic direction by pairwise choice"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="4 7 9 12 4 17"></polyline>
+            <polyline points="20 7 15 12 20 17"></polyline>
+          </svg>
+          Converge
+        </button>
         <div className="divider"></div>
 
         {/* Content search: type words to find images by what they depict */}
@@ -435,6 +451,7 @@ export default function Home() {
             <li><span className="key-hint">Search</span> by content — type what you&apos;re looking for (e.g. &quot;buttons&quot;, &quot;a red flower&quot;) and press Enter to rank images by what they depict, not their filename.</li>
             <li><span className="key-hint">Left-Click</span> an image to refill the grid with its visually nearest neighbors.</li>
             <li><span className="key-hint">Right-Click</span> an image to open the high-res original in a new tab.</li>
+            <li><span className="key-hint">Converge</span> mode — forced pairwise choices rank a diverse set by Bradley-Terry strength, then reveal which region you converged toward (←/→ or swipe; Esc to exit).</li>
             <li>Use the control buttons above to navigate your journey.</li>
           </ul>
           <p className="text-neutral-500 text-xs">The text model downloads once on your first search, then is cached for instant searches.</p>
@@ -451,6 +468,11 @@ export default function Home() {
           onRightClick={(e) => handleImageRightClick(e, item.file)}
         />
       ))}
+
+      {/* Converge overlay — mounts on demand, leaves the grid untouched */}
+      {convergeActive && (
+        <Converge items={items} onExit={() => setConvergeActive(false)} />
+      )}
     </div>
   );
 }
