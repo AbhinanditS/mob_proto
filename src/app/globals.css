@@ -450,6 +450,7 @@ body, html {
 }
 
 .converge-rank-bar-wrap {
+  position: relative;
   flex: 1;
   height: 8px;
   background: rgba(255, 255, 255, 0.06);
@@ -457,7 +458,18 @@ body, html {
   overflow: hidden;
 }
 
+/* Confidence interval — faint band behind the point-estimate bar. */
+.converge-rank-ci {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+}
+
 .converge-rank-bar {
+  position: relative;
+  z-index: 1;
   height: 100%;
   background: linear-gradient(
     90deg,
@@ -469,12 +481,17 @@ body, html {
 }
 
 .converge-rank-meta {
-  width: 150px;
+  width: 184px;
   text-align: right;
   font-family: monospace;
   font-size: 0.72rem;
   color: rgba(255, 255, 255, 0.4);
   flex-shrink: 0;
+}
+
+.converge-rank-ci-num {
+  color: rgba(255, 255, 255, 0.25);
+  margin-left: 3px;
 }
 
 /* Cluster location */
