@@ -1,12 +1,23 @@
 // Converge mode — pure logic (no React).
 //
-// Goal: from a diverse pool of candidate images, force pairwise "which do you
-// want your portfolio to look like?" choices, score them with a
-// Bradley-Terry / Elo model, then reveal the structure of what was chosen.
+// From a diverse pool of candidate images, force pairwise "which do you want
+// your portfolio to look like?" choices, score them, then reveal the structure
+// of what was chosen.
 //
-// All vectors here are the existing SigLIP embeddings from embeddings.json,
-// already L2-normalized — so a dot product IS cosine similarity. Nothing is
-// recomputed; we only read these vectors.
+// Scoring is deliberately deep:
+//   - An online TrueSkill-style model (mean mu + uncertainty sigma per image),
+//     updated after every comparison. The uncertainty drives both pairing and
+//     the displayed confidence.
+//   - Adaptive pairing that maximizes information AND visual difficulty: it
+//     prefers near-coin-flip matchups between visually similar images, so each
+//     choice is genuinely hard and maximally informative.
+//   - A final joint Bradley-Terry MAP fit over the whole comparison log for the
+//     most accurate point ranking, with embedding-based propagation so the
+//     under-compared tail is ranked by what its neighbors achieved, plus
+//     Fisher-information confidence intervals.
+//
+// All vectors are the existing SigLIP embeddings (already L2-normalized, so a
+// dot product IS cosine similarity). Nothing is recomputed.
 
 export interface ConvergeItem {
   id: string;
@@ -16,11 +27,12 @@ export interface ConvergeItem {
 export interface PoolEntry {
   id: string;
   vec: Float32Array;
-  elo: number;          // live online score, updated every comparison
+  mu: number;           // TrueSkill skill mean (online)
+  sigma: number;        // TrueSkill skill uncertainty (online)
   appearances: number;
   wins: number;
   losses: number;
-  strength: number;     // Bradley-Terry strength, filled in after the run
+  strength: number;     // final Bradley-Terry strength (filled after the run)
 }
 
 export interface Comparison {
@@ -35,7 +47,9 @@ export interface RankedRow {
   rank: number;
   id: string;
   strength: number;
-  normScore: number;    // 0..100 for display
+  normScore: number;    // 0..100 point estimate
+  ciLow: number;        // 0..100 lower confidence bound
+  ciHigh: number;       // 0..100 upper confidence bound
   appearances: number;
   wins: number;
   losses: number;
@@ -44,42 +58,52 @@ export interface RankedRow {
 
 export interface ClusterLocation {
   clusterId: number;
-  representativeId: string;   // member nearest the cluster centroid
-  label: string;              // keywords mined from member filenames
+  representativeId: string;
+  label: string;
   size: number;
-  similarity: number;         // cosine(picks-centroid, cluster centroid)
+  similarity: number;
 }
 
 export interface TensionPair {
-  winnerId: string;           // the image you chose
-  loserId: string;            // the image you rejected
+  winnerId: string;
+  loserId: string;
   turn: number;
   winnerStrength: number;
   loserStrength: number;
-  upset: number;              // loserStrength - winnerStrength (how big the contradiction)
+  upset: number;
 }
 
 export interface AnalysisResult {
   ranked: RankedRow[];
-  centroid: Float32Array;     // strength-weighted centroid of the pool
+  centroid: Float32Array;
   clusterLocation: ClusterLocation | null;
-  inBetween: string[];        // 20-25 ids from the FULL dataset, never compared
+  inBetween: string[];
   tensionPair: TensionPair | null;
 }
 
 // Tunables
-export const POOL_SIZE = 28;
-export const MAX_COMPARISONS = 20;
-const ELO_START = 1500;
-const ELO_K = 24;
-const APPEAR_PENALTY = 40;     // Elo-points per prior appearance (coverage pressure)
+export const POOL_SIZE = 26;
+export const MAX_COMPARISONS = 26;
+
+// TrueSkill parameters (standard defaults, on a 0..50 scale).
+const MU0 = 25;
+const SIGMA0 = 25 / 3;
+const BETA2 = (SIGMA0 / 2) * (SIGMA0 / 2); // performance variance
+const TAU2 = (SIGMA0 / 100) * (SIGMA0 / 100); // per-game dynamics
+const PAIR_EMB_WEIGHT = 0.5; // how strongly to prefer visually similar pairs
+
+// Bradley-Terry / propagation / clustering
+const BT_PRIOR = 1.0;        // virtual win/loss vs a mean-strength phantom
+const BT_ITERS = 200;
+const BT_RIDGE = 0.25;       // Normal(0, 1/ridge) prior on log-strength → bounds SEs
+const PROP_K0 = 2.5;         // appearances pseudo-count for the propagation blend
+const PROP_TEMP = 0.08;      // softmax temperature over cosine in propagation
 const K_CLUSTERS = 8;
-const KMEANS_SEED = 1234567;   // fixed → deterministic, frozen clustering
-const BT_PRIOR = 1.0;          // virtual win/loss vs a mean-strength phantom
+const KMEANS_SEED = 1234567;
 const IN_BETWEEN_COUNT = 24;
 
 // ---------------------------------------------------------------------------
-// Vector math
+// Vector + scalar math
 // ---------------------------------------------------------------------------
 
 export function dot(a: Float32Array, b: Float32Array): number {
@@ -98,7 +122,36 @@ function l2normalize(v: Float32Array): Float32Array {
   return out;
 }
 
-// Deterministic PRNG (mulberry32) so k-means is identical across reloads.
+// Abramowitz-Stegun erf → standard normal pdf/cdf.
+function erf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+    a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * ax);
+  const y = 1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+  return sign * y;
+}
+const INV_SQRT_2PI = 1 / Math.sqrt(2 * Math.PI);
+function normCdf(x: number): number {
+  return 0.5 * (1 + erf(x / Math.SQRT2));
+}
+function normPdf(x: number): number {
+  return INV_SQRT_2PI * Math.exp(-0.5 * x * x);
+}
+// TrueSkill truncated-Gaussian helpers for a win (no draws).
+function vWin(t: number): number {
+  const c = normCdf(t);
+  return c < 1e-9 ? -t : normPdf(t) / c; // asymptote for extreme upsets
+}
+function wWin(t: number): number {
+  const v = vWin(t);
+  return v * (v + t);
+}
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-x));
+}
+
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return function () {
@@ -114,8 +167,6 @@ function mulberry32(seed: number): () => number {
 // Candidate pool — farthest-point sampling for a diverse spread
 // ---------------------------------------------------------------------------
 
-// Greedily pick `n` items that are maximally spread across embedding space, so
-// the forced choices span the full aesthetic range. Fresh seed each run.
 export function farthestPointSample(items: ConvergeItem[], n: number): ConvergeItem[] {
   const count = Math.min(n, items.length);
   if (count <= 0) return [];
@@ -124,7 +175,6 @@ export function farthestPointSample(items: ConvergeItem[], n: number): ConvergeI
   const seedIdx = Math.floor(Math.random() * items.length);
   selected.push(items[seedIdx]);
 
-  // minDist[i] = min cosine distance (1 - dot) from item i to the chosen set.
   const minDist = new Float32Array(items.length);
   for (let i = 0; i < items.length; i++) {
     minDist[i] = 1 - dot(items[i].vec, items[seedIdx].vec);
@@ -144,7 +194,6 @@ export function farthestPointSample(items: ConvergeItem[], n: number): ConvergeI
     selected.push(items[best]);
     const added = items[best];
     minDist[best] = -Infinity;
-    // Update min distances against the newly added point.
     for (let i = 0; i < items.length; i++) {
       if (minDist[i] === -Infinity) continue;
       const d = 1 - dot(items[i].vec, added.vec);
@@ -156,7 +205,7 @@ export function farthestPointSample(items: ConvergeItem[], n: number): ConvergeI
 }
 
 // ---------------------------------------------------------------------------
-// Comparison engine — Elo + adaptive pairing
+// Comparison engine — online TrueSkill + information-maximizing pairing
 // ---------------------------------------------------------------------------
 
 function pairKey(a: string, b: string): string {
@@ -180,7 +229,8 @@ export function createEngine(
   const pool: PoolEntry[] = poolItems.map((it) => ({
     id: it.id,
     vec: it.vec,
-    elo: ELO_START,
+    mu: MU0,
+    sigma: SIGMA0,
     appearances: 0,
     wins: 0,
     losses: 0,
@@ -190,14 +240,28 @@ export function createEngine(
   const shownPairs = new Set<string>();
   const comparisons: Comparison[] = [];
 
-  // Pick the next pair: among pairs never shown, minimize
-  //   |elo_i - elo_j| + APPEAR_PENALTY * (appearances_i + appearances_j)
-  // i.e. closest-rated (most uncertain → most informative) AND fewest seen.
+  // Predicted P(a beats b) under the current skill beliefs.
+  function predictP(a: PoolEntry, b: PoolEntry): number {
+    const c = Math.sqrt(2 * BETA2 + a.sigma * a.sigma + b.sigma * b.sigma);
+    return normCdf((a.mu - b.mu) / c);
+  }
+
+  // Pair value = expected information × visual difficulty.
+  //   p(1-p)            → highest for a near coin-flip (a genuinely hard choice)
+  //   sigma_a²+sigma_b² → highest for under-explored images (learn the most)
+  //   (1 + w·cos)       → bias toward visually similar pairs (subtle choices)
+  function pairValue(a: PoolEntry, b: PoolEntry): number {
+    const p = predictP(a, b);
+    const info = p * (1 - p) * (a.sigma * a.sigma + b.sigma * b.sigma);
+    const cos = dot(a.vec, b.vec);
+    return info * (1 + PAIR_EMB_WEIGHT * Math.max(0, cos));
+  }
+
   function pickNextPair(prevKey: string | null): [PoolEntry, PoolEntry] | null {
     let best: [PoolEntry, PoolEntry] | null = null;
-    let bestCost = Infinity;
+    let bestVal = -Infinity;
     let fallback: [PoolEntry, PoolEntry] | null = null;
-    let fallbackCost = Infinity;
+    let fallbackVal = -Infinity;
 
     for (let i = 0; i < pool.length; i++) {
       for (let j = i + 1; j < pool.length; j++) {
@@ -205,18 +269,14 @@ export function createEngine(
         const b = pool[j];
         const key = pairKey(a.id, b.id);
         if (shownPairs.has(key)) continue;
-        const cost =
-          Math.abs(a.elo - b.elo) +
-          APPEAR_PENALTY * (a.appearances + b.appearances);
-        // Track an overall best (used if every remaining pair was the prev one).
-        if (cost < fallbackCost) {
-          fallbackCost = cost;
+        const val = pairValue(a, b);
+        if (val > fallbackVal) {
+          fallbackVal = val;
           fallback = [a, b];
         }
-        // Prefer not to immediately repeat the previous visual pairing.
-        if (key === prevKey) continue;
-        if (cost < bestCost) {
-          bestCost = cost;
+        if (key === prevKey) continue; // avoid an immediate visual repeat
+        if (val > bestVal) {
+          bestVal = val;
           best = [a, b];
         }
       }
@@ -224,10 +284,18 @@ export function createEngine(
     return best ?? fallback;
   }
 
-  function eloUpdate(winner: PoolEntry, loser: PoolEntry): void {
-    const expWin = 1 / (1 + Math.pow(10, (loser.elo - winner.elo) / 400));
-    winner.elo += ELO_K * (1 - expWin);
-    loser.elo -= ELO_K * (1 - expWin);
+  function trueskillUpdate(winner: PoolEntry, loser: PoolEntry): void {
+    const sw2 = winner.sigma * winner.sigma + TAU2;
+    const sl2 = loser.sigma * loser.sigma + TAU2;
+    const c2 = 2 * BETA2 + sw2 + sl2;
+    const c = Math.sqrt(c2);
+    const t = (winner.mu - loser.mu) / c;
+    const v = vWin(t);
+    const w = wWin(t);
+    winner.mu += (sw2 / c) * v;
+    loser.mu -= (sl2 / c) * v;
+    winner.sigma = Math.sqrt(Math.max(1e-6, sw2 * (1 - (sw2 / c2) * w)));
+    loser.sigma = Math.sqrt(Math.max(1e-6, sl2 * (1 - (sl2 / c2) * w)));
   }
 
   const engine: ConvergeEngine = {
@@ -250,7 +318,7 @@ export function createEngine(
       loser.appearances++;
       winner.wins++;
       loser.losses++;
-      eloUpdate(winner, loser);
+      trueskillUpdate(winner, loser);
 
       const turn = this.comparisons.length;
       this.comparisons.push({
@@ -274,24 +342,19 @@ export function createEngine(
 // Final ranking — Bayesian Bradley-Terry (minorization-maximization)
 // ---------------------------------------------------------------------------
 
-// Joint fit over the full comparison log. A small prior (virtual win + loss vs
-// a phantom of mean strength) regularizes undefeated/winless items and keeps
-// strengths finite even when the comparison graph is sparse or disconnected —
-// which it will be with ~28 images and 20 rounds.
-export function fitBradleyTerry(
+interface PairAgg {
+  wins: Float64Array;                 // total wins per index
+  pairCounts: Map<number, number>;    // key a*n+b (a<b) -> total comparisons
+}
+
+function aggregate(
   pool: PoolEntry[],
-  comparisons: Comparison[],
-  iterations = 100
-): void {
+  comparisons: Comparison[]
+): PairAgg {
   const n = pool.length;
-  if (n === 0) return;
-
   const idx = new Map(pool.map((p, i) => [p.id, i]));
-  const strength = new Float64Array(n).fill(1);
-
-  // Total wins per item, and pairwise comparison counts n_ij (symmetric).
   const wins = new Float64Array(n);
-  const pairCounts = new Map<number, number>(); // key i*n+j (i<j) -> count
+  const pairCounts = new Map<number, number>();
   for (const c of comparisons) {
     const wi = idx.get(c.winnerId);
     const li = idx.get(c.loserId);
@@ -302,11 +365,27 @@ export function fitBradleyTerry(
     const key = i * n + j;
     pairCounts.set(key, (pairCounts.get(key) ?? 0) + 1);
   }
+  return { wins, pairCounts };
+}
+
+// Joint fit over the full comparison log. A small prior (virtual win + loss vs
+// a phantom of mean strength) regularizes undefeated/winless items and keeps
+// strengths finite even when the comparison graph is sparse or disconnected.
+// Returns geometric-mean-normalized strengths.
+export function fitBradleyTerry(
+  pool: PoolEntry[],
+  comparisons: Comparison[],
+  iterations = BT_ITERS
+): Float64Array {
+  const n = pool.length;
+  const strength = new Float64Array(n).fill(1);
+  if (n === 0) return strength;
+
+  const { wins, pairCounts } = aggregate(pool, comparisons);
 
   for (let iter = 0; iter < iterations; iter++) {
     const next = new Float64Array(n);
     for (let i = 0; i < n; i++) {
-      // Denominator: real comparisons + prior games vs a phantom of strength 1.
       let denom = (2 * BT_PRIOR) / (strength[i] + 1);
       for (let j = 0; j < n; j++) {
         if (j === i) continue;
@@ -318,14 +397,127 @@ export function fitBradleyTerry(
       }
       next[i] = (wins[i] + BT_PRIOR) / denom;
     }
-    // Normalize so the geometric mean of strengths is 1 (identifiability).
     let logSum = 0;
     for (let i = 0; i < n; i++) logSum += Math.log(next[i]);
     const geo = Math.exp(logSum / n);
     for (let i = 0; i < n; i++) strength[i] = next[i] / geo;
   }
 
-  for (let i = 0; i < n; i++) pool[i].strength = strength[i];
+  return strength;
+}
+
+// Invert a small dense matrix via Gauss-Jordan (n is tiny here).
+function invertMatrix(A: number[][]): number[][] {
+  const n = A.length;
+  const M = A.map((row, i) => {
+    const aug = new Array(2 * n).fill(0);
+    for (let j = 0; j < n; j++) aug[j] = row[j];
+    aug[n + i] = 1;
+    return aug;
+  });
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    let max = Math.abs(M[col][col]);
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > max) {
+        max = Math.abs(M[r][col]);
+        piv = r;
+      }
+    }
+    if (max < 1e-12) M[col][col] += 1e-9; // numerical guard
+    if (piv !== col) {
+      const tmp = M[piv];
+      M[piv] = M[col];
+      M[col] = tmp;
+    }
+    const d = M[col][col];
+    for (let j = 0; j < 2 * n; j++) M[col][j] /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col];
+      if (f !== 0) for (let j = 0; j < 2 * n; j++) M[r][j] -= f * M[col][j];
+    }
+  }
+  return M.map((row) => row.slice(n));
+}
+
+// Standard errors on the log-strengths from the Bradley-Terry Fisher
+// information (a p(1-p)-weighted graph Laplacian, made positive-definite by the
+// prior). Under-compared images get larger errors → wider confidence bands.
+export function standardErrors(
+  pool: PoolEntry[],
+  comparisons: Comparison[],
+  strength: Float64Array
+): Float64Array {
+  const n = pool.length;
+  const se = new Float64Array(n);
+  if (n === 0) return se;
+  if (n === 1) {
+    se[0] = 1;
+    return se;
+  }
+
+  const theta = Array.from(strength, (s) => Math.log(s));
+  const { pairCounts } = aggregate(pool, comparisons);
+  const H: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+
+  for (const [key, nij] of pairCounts) {
+    const i = Math.floor(key / n);
+    const j = key % n;
+    const p = sigmoid(theta[i] - theta[j]);
+    const g = nij * p * (1 - p);
+    H[i][i] += g;
+    H[j][j] += g;
+    H[i][j] -= g;
+    H[j][i] -= g;
+  }
+  // Prior: 2*alpha phantom games vs a fixed phantom at theta=0, plus a ridge
+  // (Normal prior on theta) that bounds the variance of all-win/all-loss items.
+  for (let i = 0; i < n; i++) {
+    const p0 = sigmoid(theta[i]);
+    H[i][i] += 2 * BT_PRIOR * p0 * (1 - p0) + BT_RIDGE;
+  }
+
+  const Hinv = invertMatrix(H);
+  for (let i = 0; i < n; i++) se[i] = Math.sqrt(Math.max(0, Hinv[i][i]));
+  return se;
+}
+
+// Embedding-based propagation: pull each image's log-strength toward a
+// similarity-weighted average of the well-observed images. Heavily-compared
+// images keep their own estimate; the sparse tail inherits its neighbors'.
+export function propagateStrengths(
+  pool: PoolEntry[],
+  strength: Float64Array
+): Float64Array {
+  const n = pool.length;
+  if (n === 0) return strength;
+
+  const theta = Array.from(strength, (s) => Math.log(s));
+  const reliability = pool.map((p) => p.appearances / (p.appearances + PROP_K0));
+  const out = new Float64Array(n);
+
+  for (let i = 0; i < n; i++) {
+    let wsum = 0;
+    let acc = 0;
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const w = Math.exp(dot(pool[i].vec, pool[j].vec) / PROP_TEMP) * reliability[j];
+      wsum += w;
+      acc += w * theta[j];
+    }
+    const thetaKernel = wsum > 0 ? acc / wsum : theta[i];
+    const blend = reliability[i];
+    out[i] = blend * theta[i] + (1 - blend) * thetaKernel;
+  }
+
+  // Re-normalize to geometric mean 1.
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += out[i];
+  mean /= n;
+  const result = new Float64Array(n);
+  for (let i = 0; i < n; i++) result[i] = Math.exp(out[i] - mean);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,15 +526,13 @@ export function fitBradleyTerry(
 
 interface ClusterModel {
   centroids: Float32Array[];
-  assignments: number[];   // cluster index per item, parallel to the items array
+  assignments: number[];
   itemIds: string[];
 }
 
 let clusterCache: ClusterModel | null = null;
 let clusterCacheKey = "";
 
-// Cosine k-means: vectors are unit-norm, so assignment = argmax dot, and each
-// centroid is the L2-normalized mean of its members. Seeded → frozen geometry.
 export function getClusters(items: ConvergeItem[], k = K_CLUSTERS): ClusterModel {
   const cacheKey = `${items.length}:${k}`;
   if (clusterCache && clusterCacheKey === cacheKey) return clusterCache;
@@ -351,7 +541,6 @@ export function getClusters(items: ConvergeItem[], k = K_CLUSTERS): ClusterModel
   const dim = n > 0 ? items[0].vec.length : 0;
   const rng = mulberry32(KMEANS_SEED);
 
-  // k-means++ style seeding with the seeded PRNG.
   const centroids: Float32Array[] = [];
   const first = Math.floor(rng() * n);
   centroids.push(new Float32Array(items[first].vec));
@@ -378,7 +567,6 @@ export function getClusters(items: ConvergeItem[], k = K_CLUSTERS): ClusterModel
   const assignments = new Array<number>(n).fill(0);
   for (let iter = 0; iter < 50; iter++) {
     let changed = false;
-    // Assign.
     for (let i = 0; i < n; i++) {
       let best = 0;
       let bestSim = -Infinity;
@@ -394,7 +582,6 @@ export function getClusters(items: ConvergeItem[], k = K_CLUSTERS): ClusterModel
         changed = true;
       }
     }
-    // Recompute centroids as normalized means.
     const sums = Array.from({ length: k }, () => new Float64Array(dim));
     const counts = new Int32Array(k);
     for (let i = 0; i < n; i++) {
@@ -405,7 +592,7 @@ export function getClusters(items: ConvergeItem[], k = K_CLUSTERS): ClusterModel
       for (let d = 0; d < dim; d++) s[d] += v[d];
     }
     for (let c = 0; c < k; c++) {
-      if (counts[c] === 0) continue; // keep prior centroid for empty clusters
+      if (counts[c] === 0) continue;
       const mean = new Float32Array(dim);
       for (let d = 0; d < dim; d++) mean[d] = sums[c][d] / counts[c];
       centroids[c] = l2normalize(mean);
@@ -428,8 +615,6 @@ const STOPWORDS = new Set([
   "as", "image", "photo", "picture", "next", "near", "some", "other",
 ]);
 
-// Filenames look like: `001_733734964335..._This_may_contain_<caption>`.
-// Strip the leading numeric ids and mine frequent caption tokens.
 function labelFromIds(ids: string[], byId: Map<string, ConvergeItem>): string {
   const counts = new Map<string, number>();
   for (const id of ids) {
@@ -460,35 +645,53 @@ export function analyze(
   allItems: ConvergeItem[]
 ): AnalysisResult {
   const { pool, comparisons } = engine;
+  const n = pool.length;
 
-  // Joint Bradley-Terry fit for the accurate final ranking.
-  fitBradleyTerry(pool, comparisons);
+  // Accurate joint point estimate, its confidence, then embedding propagation.
+  const bt = fitBradleyTerry(pool, comparisons);
+  const se = standardErrors(pool, comparisons, bt);
+  const finalStrength = propagateStrengths(pool, bt);
+  for (let i = 0; i < n; i++) pool[i].strength = finalStrength[i];
 
-  // 1. Ranked list with normalized 0..100 scores.
-  const sorted = [...pool].sort((a, b) => b.strength - a.strength);
-  const logs = sorted.map((p) => Math.log(p.strength));
-  const minLog = Math.min(...logs);
-  const maxLog = Math.max(...logs);
-  const span = maxLog - minLog || 1;
-  const ranked: RankedRow[] = sorted.map((p, i) => ({
-    rank: i + 1,
-    id: p.id,
-    strength: p.strength,
-    normScore: ((Math.log(p.strength) - minLog) / span) * 100,
-    appearances: p.appearances,
-    wins: p.wins,
-    losses: p.losses,
-    winRate: p.appearances > 0 ? p.wins / p.appearances : 0,
-  }));
+  // 1. Ranked list with normalized scores + confidence bands.
+  const order = Array.from({ length: n }, (_, i) => i).sort(
+    (a, b) => finalStrength[b] - finalStrength[a]
+  );
+  const logs = Array.from(finalStrength, (s) => Math.log(s));
+  // The display scale comes from the Bradley-Terry spread (not the propagated,
+  // compressed one) so confidence widths stay in honest, comparable units.
+  const btLogs = Array.from(bt, (s) => Math.log(s));
+  const minLog = Math.min(...btLogs);
+  const maxLog = Math.max(...btLogs);
+  const slope = 100 / (maxLog - minLog || 1);
+  const clamp = (x: number) => Math.max(0, Math.min(100, x));
+  const ranked: RankedRow[] = order.map((i, rankIdx) => {
+    const p = pool[i];
+    const normScore = clamp((logs[i] - minLog) * slope);
+    const half = se[i] * slope;
+    return {
+      rank: rankIdx + 1,
+      id: p.id,
+      strength: finalStrength[i],
+      normScore,
+      ciLow: clamp(normScore - half),
+      ciHigh: clamp(normScore + half),
+      appearances: p.appearances,
+      wins: p.wins,
+      losses: p.losses,
+      winRate: p.appearances > 0 ? p.wins / p.appearances : 0,
+    };
+  });
 
   // 2. Strength-weighted centroid of the pool (top picks dominate).
-  const dim = pool.length > 0 ? pool[0].vec.length : 0;
+  const dim = n > 0 ? pool[0].vec.length : 0;
   const acc = new Float64Array(dim);
   let wsum = 0;
-  for (const p of pool) {
-    const w = p.strength;
+  for (let i = 0; i < n; i++) {
+    const w = finalStrength[i];
     wsum += w;
-    for (let d = 0; d < dim; d++) acc[d] += w * p.vec[d];
+    const v = pool[i].vec;
+    for (let d = 0; d < dim; d++) acc[d] += w * v[d];
   }
   const centroidRaw = new Float32Array(dim);
   for (let d = 0; d < dim; d++) centroidRaw[d] = wsum > 0 ? acc[d] / wsum : 0;
@@ -509,7 +712,6 @@ export function analyze(
         bestC = c;
       }
     }
-    // Members of the winning cluster + its representative image.
     const memberIds: string[] = [];
     let repId = "";
     let repSim = -Infinity;

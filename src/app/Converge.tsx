@@ -190,11 +190,14 @@ export default function Converge({ items, onExit }: ConvergeProps) {
           <section className="converge-section">
             <h3>Ranking</h3>
             <p className="converge-sub">
-              Bradley-Terry strength over {MAX_COMPARISONS} forced choices.
+              Bradley-Terry strength over {result.ranked.reduce((a, r) => a + r.appearances, 0) / 2}{" "}
+              forced choices. The faint band is the confidence interval — wider
+              means less certain.
             </p>
             <div className="converge-ranklist">
               {result.ranked.map((row) => {
                 const img = byId.get(row.id);
+                const ci = Math.round((row.ciHigh - row.ciLow) / 2);
                 return (
                   <div key={row.id} className="converge-rankrow">
                     <span className="converge-rank-num">{row.rank}</span>
@@ -203,12 +206,21 @@ export default function Converge({ items, onExit }: ConvergeProps) {
                     )}
                     <div className="converge-rank-bar-wrap">
                       <div
+                        className="converge-rank-ci"
+                        style={{
+                          left: `${row.ciLow}%`,
+                          width: `${Math.max(0.5, row.ciHigh - row.ciLow)}%`,
+                        }}
+                      />
+                      <div
                         className="converge-rank-bar"
                         style={{ width: `${Math.max(2, row.normScore)}%` }}
                       />
                     </div>
                     <span className="converge-rank-meta">
-                      {row.normScore.toFixed(0)} · {row.wins}/{row.appearances}
+                      {row.normScore.toFixed(0)}
+                      <span className="converge-rank-ci-num">±{ci}</span> ·{" "}
+                      {row.wins}/{row.appearances}
                       {row.appearances > 0
                         ? ` · ${(row.winRate * 100).toFixed(0)}%`
                         : " · unseen"}
