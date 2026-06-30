@@ -136,12 +136,14 @@ const ANGLE = (a: Float32Array, b: Float32Array) =>
 // Minimum spanning tree over all items (Prim, O(n²)), edges weighted by angular
 // distance. Built once and cached for the session — it's independent of which
 // endpoints are picked, like the UMAP layout. Returned as an adjacency list.
+// Keyed by the items array identity (not its length): a same-length array with
+// different vectors — e.g. a re-imported embeddings.json — must rebuild the tree,
+// since the cached adjacency indexes into the specific vectors it was built from.
 let mstCache: number[][] | null = null;
-let mstCacheKey = "";
+let mstCacheItems: NavItem[] | null = null;
 function buildMST(items: NavItem[]): number[][] {
+  if (mstCache && mstCacheItems === items) return mstCache;
   const n = items.length;
-  const key = String(n);
-  if (mstCache && mstCacheKey === key) return mstCache;
 
   const adj: number[][] = Array.from({ length: n }, () => []);
   if (n > 1) {
@@ -167,7 +169,7 @@ function buildMST(items: NavItem[]): number[][] {
     }
   }
   mstCache = adj;
-  mstCacheKey = key;
+  mstCacheItems = items;
   return adj;
 }
 
