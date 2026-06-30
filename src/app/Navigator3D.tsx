@@ -599,6 +599,10 @@ class NavigatorScene {
   setPathCursor(id: string) {
     const index = this.idToIndex.get(id);
     if (index === undefined) return;
+    // Scrubbing fires every drag tick, but a path segment spans many slider
+    // values — bail when the cursor image is unchanged so we don't restart the
+    // same thumbnail/original loads (and the 404 fallback) on every tick.
+    if (index === this.focusedIndex) return;
     this.focusedIndex = index;
     this.material.uniforms.uFocusedIndex.value = index;
     const p = new THREE.Vector3();
