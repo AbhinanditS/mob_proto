@@ -7,19 +7,25 @@
 // UMAP positions come from navigator3d.computeLayout() and are READ ONLY by the
 // renderer. Every neighbor lookup goes through getNeighbors() → dot() on the full
 // SigLIP vectors — never the 3D layout.
+//
+// Two modes: "explore" (orbit + click-to-focus + neighbor stepping) and "probe"
+// (an interactive point-cloud instrument). Probe mode reads positions from the
+// SAME frozen layout array and never mutates it; its k-NN/density queries run in
+// layout space (Euclidean), distinct from getNeighbors()'s full-vector cosine
+// search, and its drag-to-pull warp only ever touches a separate display buffer —
+// never the canonical layout, never .vec.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { ConvergeImage } from "./Converge";
-import { dot } from "./converge";
 import {
-  buildWalk,
+  computeDensity,
   computeLayout,
   getNeighbors,
+  kNearestByPosition,
   LAYOUT_RADIUS,
   type Neighbor,
-  type PathStop,
 } from "./navigator3d";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +44,16 @@ const IDLE_MS = 2500;
 const AUTO_ROTATE_SPEED = 0.55;
 const TILE = 256;
 
+// Probe mode tunables.
+const PROBE_K = 8; // live reconstruction neighbor count
+const PROBE_POOL_SIZE = 9; // hover slot + top-PROBE_K query results
+const PROBE_DEBOUNCE_MS = 120;
+const PROBE_BASE_SCALE = 0.35; // at-rest shrink factor for probe-mode points
+const PROBE_SPRITE_SIZE = LAYOUT_RADIUS * 0.16; // pooled hi-res billboard size
+const DENSITY_K = 6;
+const WARP_RADIUS = LAYOUT_RADIUS * 0.25;
+const WARP_RELEASE_MS = 450;
+
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
@@ -46,8 +62,38 @@ function pow2(x: number): number {
   return Math.pow(2, Math.ceil(Math.log2(Math.max(1, x))));
 }
 
+// Minimal trailing-edge debounce — no debounce utility exists elsewhere in the
+// codebase. cancel() lets callers flush a pending timer on teardown.
+function debounce<F extends (...args: never[]) => void>(
+  fn: F,
+  ms: number
+): F & { cancel: () => void } {
+  let timer: number | null = null;
+  const wrapped = ((...args: Parameters<F>) => {
+    if (timer !== null) window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      timer = null;
+      fn(...args);
+    }, ms);
+  }) as F & { cancel: () => void };
+  wrapped.cancel = () => {
+    if (timer !== null) window.clearTimeout(timer);
+    timer = null;
+  };
+  return wrapped;
+}
+
 interface SceneCallbacks {
   onPick: (id: string | null) => void;
+  onProbeQuery: (result: { id: string; dist: number }[], meanDist: number) => void;
+}
+
+interface HiResSlot {
+  sprite: THREE.Sprite;
+  material: THREE.SpriteMaterial;
+  texture: THREE.Texture | null;
+  index: number;
+  seq: number;
 }
 
 const VERT = /* glsl */ `
@@ -56,16 +102,21 @@ const VERT = /* glsl */ `
   attribute float iAspect;
   attribute float iState;
   attribute float iIndex;
+  attribute float iPromote;
+  attribute float iDensity;
 
   uniform float uBaseSize;
   uniform float uDistGain;
   uniform float uRefDepth;
   uniform float uFocusedIndex;
+  uniform float uProbeActive;
+  uniform float uProbeBaseScale;
 
   varying vec2 vUv;
   varying vec2 vQuadUv;
   varying float vState;
   varying float vDepth;
+  varying float vDensity;
 
   void main() {
     vQuadUv = uv;
@@ -73,6 +124,7 @@ const VERT = /* glsl */ `
     vUv = vec2(iAtlasUV.x + uv.x * iAtlasUV.z,
                iAtlasUV.y + (1.0 - uv.y) * iAtlasUV.w);
     vState = iState;
+    vDensity = iDensity;
 
     vec4 mv = modelViewMatrix * vec4(iOffset, 1.0);
     float depth = -mv.z;
@@ -80,11 +132,19 @@ const VERT = /* glsl */ `
 
     float gain = 1.0 + uDistGain * clamp(depth / uRefDepth, 0.0, 2.0);
     float emph = 1.0 + 0.22 * iState;
-    float h = uBaseSize * gain * emph;
+    // Probe mode: shrink at rest, scaled further by local density so sparse
+    // points read smaller/dimmer than dense ones. A no-op when uProbeActive=0,
+    // so explore mode's output stays pixel-identical to before.
+    float probeShrink = mix(1.0, uProbeBaseScale, uProbeActive);
+    float densityScale = mix(1.0, mix(0.45, 1.0, iDensity), uProbeActive);
+    float h = uBaseSize * gain * emph * probeShrink * densityScale;
     float w = h * iAspect;
 
-    // Collapse the focused instance — the hi-res sprite stands in for it.
-    if (abs(iIndex - uFocusedIndex) < 0.5) { w = 0.0; h = 0.0; }
+    // Collapse the focused instance (explore mode) OR a promoted hi-res-pool
+    // instance (probe mode) — a dedicated sprite stands in for it either way.
+    bool collapseFocus = abs(iIndex - uFocusedIndex) < 0.5;
+    bool collapsePromoted = uProbeActive > 0.5 && iPromote > 0.5;
+    if (collapseFocus || collapsePromoted) { w = 0.0; h = 0.0; }
 
     mv.xy += vec2(position.x * w, position.y * h);
     gl_Position = projectionMatrix * mv;
@@ -97,11 +157,13 @@ const FRAG = /* glsl */ `
   uniform vec3 uFogColor;
   uniform float uFogDensity;
   uniform vec3 uRingColor;
+  uniform float uProbeActive;
 
   varying vec2 vUv;
   varying vec2 vQuadUv;
   varying float vState;
   varying float vDepth;
+  varying float vDensity;
 
   void main() {
     vec4 tex = texture2D(uAtlas, vUv);
@@ -117,6 +179,15 @@ const FRAG = /* glsl */ `
       alpha = max(alpha, ring);
     }
 
+    // Probe mode: dim + desaturate points in sparse regions — same iDensity
+    // attribute that already drove point size above, no extra cost.
+    if (uProbeActive > 0.5) {
+      float gray = dot(color, vec3(0.299, 0.587, 0.114));
+      float sat = mix(0.35, 1.0, vDensity);
+      color = mix(vec3(gray), color, sat);
+      alpha *= mix(0.55, 1.0, vDensity);
+    }
+
     // Exponential-squared depth fog toward the near-black background.
     float f = 1.0 - exp(-uFogDensity * uFogDensity * vDepth * vDepth);
     color = mix(color, uFogColor, clamp(f, 0.0, 1.0));
@@ -127,7 +198,8 @@ const FRAG = /* glsl */ `
 
 // ---------------------------------------------------------------------------
 // NavigatorScene — the imperative three.js engine. React drives it via focus()
-// / reset() and listens through callbacks; it owns the render loop and picking.
+// / reset() / setProbeActive() and listens through callbacks; it owns the
+// render loop and picking.
 // ---------------------------------------------------------------------------
 class NavigatorScene {
   private canvas: HTMLCanvasElement;
@@ -139,10 +211,17 @@ class NavigatorScene {
   private camera!: THREE.PerspectiveCamera;
   private controls!: OrbitControls;
 
-  private positions!: Float32Array; // n*3, RENDER ONLY
+  private positions!: Float32Array; // n*3, RENDER ONLY, frozen — never mutated
+  private displayPositions!: Float32Array; // n*3 = positions + warpOffsets, backs iOffset
+  private warpOffsets!: Float32Array; // n*3, persistent drag-warp accumulator
   private aspects!: Float32Array; // per-instance image aspect (w/h)
   private stateArr!: Float32Array; // per-instance emphasis (animated)
+  private promoteArr!: Float32Array; // per-instance probe hi-res-pool membership
+  private densityArr!: Float32Array; // per-instance local density [0,1]
   private iStateAttr!: THREE.InstancedBufferAttribute;
+  private iOffsetAttr!: THREE.InstancedBufferAttribute;
+  private iPromoteAttr!: THREE.InstancedBufferAttribute;
+  private iDensityAttr!: THREE.InstancedBufferAttribute;
   private material!: THREE.ShaderMaterial;
   private geometry!: THREE.InstancedBufferGeometry;
   private mesh!: THREE.Mesh;
@@ -152,10 +231,6 @@ class NavigatorScene {
   private hiResMaterial: THREE.SpriteMaterial | null = null;
   private hiResTexture: THREE.Texture | null = null;
   private hiResSeq = 0;
-
-  // Latent-space slider path: a polyline through the cloud + a cursor marker.
-  private pathLine: THREE.Line | null = null;
-  private pathMarker: THREE.Mesh | null = null;
 
   private idToIndex = new Map<string, number>();
   private n = 0;
@@ -176,9 +251,30 @@ class NavigatorScene {
   private raf = 0;
   private disposed = false;
 
+  // ---- probe mode -----------------------------------------------------------
+  private probeActive = false;
+  private probePoint = new THREE.Vector3();
+  private probeMarker: THREE.Mesh | null = null;
+  private raycaster = new THREE.Raycaster();
+  private hiResPool: HiResSlot[] = [];
+  private lastProbeIndices: number[] = [];
+  private lastClientX: number | null = null;
+  private lastClientY: number | null = null;
+  private orbiting = false;
+  private scheduleProbeQuery!: (() => void) & { cancel: () => void };
+
+  // ---- drag-to-pull warp ------------------------------------------------------
+  private warpActive = false;
+  private warpAnchorIndex = -1;
+  private warpAnchorOrigin = new THREE.Vector3(); // fixed grabbed-point layout pos
+  private warpCursorWorld = new THREE.Vector3(); // evolving dragged-to world pos
+  private warpReleaseTween: { active: boolean; start: number; from: Float32Array } | null = null;
+
   // scratch
   private tmpV = new THREE.Vector3();
   private tmpT = new THREE.Vector3();
+  private tmpProbe = new THREE.Vector3();
+  private tmpNdc = new THREE.Vector2();
   private down: { x: number; y: number; t: number; id: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement, items: ConvergeImage[], cb: SceneCallbacks) {
@@ -192,12 +288,15 @@ class NavigatorScene {
     this.onPointerUp = this.onPointerUp.bind(this);
     this.onControlsStart = this.onControlsStart.bind(this);
     this.onControlsEnd = this.onControlsEnd.bind(this);
+    this.scheduleProbeQuery = debounce(() => this.runProbeQuery(), PROBE_DEBOUNCE_MS);
   }
 
   // Build atlas + mesh, wire the scene, start the loop. Resolves once visible.
   async build(): Promise<void> {
     // Lay out the cloud (UMAP, cached). RENDER ONLY.
     this.positions = computeLayout(this.items);
+    this.displayPositions = this.positions.slice();
+    this.warpOffsets = new Float32Array(this.n * 3);
 
     const atlas = await this.buildAtlas();
     if (this.disposed) return;
@@ -239,6 +338,7 @@ class NavigatorScene {
     this.controls.addEventListener("end", this.onControlsEnd);
 
     this.buildMesh(atlas);
+    this.buildProbeMarker();
 
     this.canvas.addEventListener("pointermove", this.onPointerMove);
     this.canvas.addEventListener("pointerdown", this.onPointerDown);
@@ -250,6 +350,13 @@ class NavigatorScene {
       if (this.tween.active) this.stepTween(now);
       else this.controls.update();
       this.updateEmphasis();
+      if (this.probeActive) {
+        if (this.orbiting && !this.warpActive && this.lastClientX !== null && this.lastClientY !== null) {
+          this.updateProbePoint(this.lastClientX, this.lastClientY);
+        }
+        this.syncPoolPositions();
+      }
+      if (this.warpReleaseTween?.active) this.stepWarpRelease(now);
       this.renderer.render(this.scene, this.camera);
     };
     this.raf = requestAnimationFrame(animate);
@@ -337,6 +444,8 @@ class NavigatorScene {
     this.atlasTexture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
     this.aspects = atlas.aspects;
     this.stateArr = new Float32Array(n);
+    this.promoteArr = new Float32Array(n);
+    this.densityArr = new Float32Array(n).fill(1); // neutral until computeDensity runs
 
     const indices = new Float32Array(n);
     for (let i = 0; i < n; i++) indices[i] = i;
@@ -347,13 +456,21 @@ class NavigatorScene {
     geo.setAttribute("position", base.getAttribute("position"));
     geo.setAttribute("uv", base.getAttribute("uv"));
     geo.instanceCount = n;
-    geo.setAttribute("iOffset", new THREE.InstancedBufferAttribute(this.positions, 3));
+    this.iOffsetAttr = new THREE.InstancedBufferAttribute(this.displayPositions, 3);
+    this.iOffsetAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("iOffset", this.iOffsetAttr);
     geo.setAttribute("iAtlasUV", new THREE.InstancedBufferAttribute(atlas.uvs, 4));
     geo.setAttribute("iAspect", new THREE.InstancedBufferAttribute(atlas.aspects, 1));
     this.iStateAttr = new THREE.InstancedBufferAttribute(this.stateArr, 1);
     this.iStateAttr.setUsage(THREE.DynamicDrawUsage);
     geo.setAttribute("iState", this.iStateAttr);
     geo.setAttribute("iIndex", new THREE.InstancedBufferAttribute(indices, 1));
+    this.iPromoteAttr = new THREE.InstancedBufferAttribute(this.promoteArr, 1);
+    this.iPromoteAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("iPromote", this.iPromoteAttr);
+    this.iDensityAttr = new THREE.InstancedBufferAttribute(this.densityArr, 1);
+    this.iDensityAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("iDensity", this.iDensityAttr);
     base.dispose();
 
     this.material = new THREE.ShaderMaterial({
@@ -366,6 +483,8 @@ class NavigatorScene {
         uFogColor: { value: new THREE.Vector3(5 / 255, 5 / 255, 5 / 255) },
         uFogDensity: { value: FOG_DENSITY },
         uRingColor: { value: new THREE.Vector3(1, 1, 1) },
+        uProbeActive: { value: 0 },
+        uProbeBaseScale: { value: PROBE_BASE_SCALE },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
@@ -378,6 +497,20 @@ class NavigatorScene {
     this.mesh = new THREE.Mesh(geo, this.material);
     this.mesh.frustumCulled = false;
     this.scene.add(this.mesh);
+  }
+
+  private buildProbeMarker() {
+    const geo = new THREE.SphereGeometry(LAYOUT_RADIUS * 0.012, 12, 12);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x7dd3fc,
+      transparent: true,
+      opacity: 0.85,
+      depthTest: false,
+    });
+    this.probeMarker = new THREE.Mesh(geo, mat);
+    this.probeMarker.renderOrder = 12;
+    this.probeMarker.visible = false;
+    this.scene.add(this.probeMarker);
   }
 
   // ---- render loop helpers -------------------------------------------------
@@ -525,104 +658,255 @@ class NavigatorScene {
     }
   }
 
-  // ---- latent-space slider path -------------------------------------------
+  // ---- probe mode: hi-res pool (proximity/hover sharpening) ----------------
 
-  private posOf(id: string, into: THREE.Vector3): boolean {
-    const i = this.idToIndex.get(id);
-    if (i === undefined) return false;
-    into.set(
-      this.positions[i * 3],
-      this.positions[i * 3 + 1],
-      this.positions[i * 3 + 2]
-    );
-    return true;
+  private makeHiResSlot(): HiResSlot {
+    const material = new THREE.SpriteMaterial({ transparent: true, depthTest: false, fog: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.renderOrder = 8;
+    sprite.visible = false;
+    this.scene.add(sprite);
+    return { sprite, material, texture: null, index: -1, seq: 0 };
   }
 
-  // Draw a polyline through the layout positions of the distinct images the arc
-  // passes through, and frame the camera once to fit it. Layout is RENDER ONLY —
-  // the path order itself comes from the full-vector slerp walk upstream.
-  setPath(ids: string[]) {
-    this.clearPath();
-    this.controls.autoRotate = false;
-    this.clearIdle();
-    if (ids.length === 0) return;
-
-    const pts: THREE.Vector3[] = [];
-    const p = new THREE.Vector3();
-    for (const id of ids) {
-      if (this.posOf(id, p)) pts.push(p.clone());
-    }
-    if (pts.length === 0) return;
-
-    if (pts.length >= 2) {
-      const geo = new THREE.BufferGeometry().setFromPoints(pts);
-      const mat = new THREE.LineBasicMaterial({
-        color: 0xffffff,
-        transparent: true,
-        opacity: 0.5,
-        depthTest: false,
-      });
-      this.pathLine = new THREE.Line(geo, mat);
-      this.pathLine.frustumCulled = false;
-      this.pathLine.renderOrder = 9;
-      this.scene.add(this.pathLine);
-    }
-
-    // Cursor marker — a small emissive sphere riding the current arc point.
-    const markerGeo = new THREE.SphereGeometry(LAYOUT_RADIUS * 0.018, 16, 16);
-    const markerMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.9,
-      depthTest: false,
+  private loadIntoSlot(slot: HiResSlot) {
+    const seq = ++slot.seq;
+    const index = slot.index;
+    const item = this.items[index];
+    const loader = new THREE.TextureLoader();
+    loader.load(item.thumb, (tex) => {
+      if (this.disposed || slot.seq !== seq) {
+        tex.dispose();
+        return;
+      }
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+      if (slot.texture) slot.texture.dispose();
+      slot.texture = tex;
+      slot.material.map = tex;
+      slot.material.needsUpdate = true;
+      const a = item.w / item.h || 1;
+      const sw = a >= 1 ? PROBE_SPRITE_SIZE : PROBE_SPRITE_SIZE * a;
+      const sh = a >= 1 ? PROBE_SPRITE_SIZE / a : PROBE_SPRITE_SIZE;
+      slot.sprite.scale.set(sw, sh, 1);
+      slot.sprite.position.set(
+        this.displayPositions[index * 3],
+        this.displayPositions[index * 3 + 1],
+        this.displayPositions[index * 3 + 2]
+      );
+      slot.sprite.visible = true;
     });
-    this.pathMarker = new THREE.Mesh(markerGeo, markerMat);
-    this.pathMarker.renderOrder = 11;
-    this.scene.add(this.pathMarker);
-
-    // Frame the camera once to fit the path's bounding box.
-    const box = new THREE.Box3().setFromPoints(pts);
-    const center = box.getCenter(new THREE.Vector3());
-    const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, LAYOUT_RADIUS * 0.2);
-    const dir = this.camera.position.clone().sub(this.controls.target);
-    if (dir.lengthSq() < 1e-6) dir.copy(this.overviewPos);
-    dir.normalize().multiplyScalar(radius / Math.tan((FOV * Math.PI) / 180 / 2) + radius);
-    this.frameCameraTo(center.clone().add(dir), center.clone());
   }
 
-  // Per-scrub update: park the hi-res sprite + marker on this image instantly
-  // (no camera tween — focus() would lurch on every slider tick) and collapse
-  // its instanced quad so the hi-res billboard stands in for it.
-  setPathCursor(id: string) {
-    const index = this.idToIndex.get(id);
-    if (index === undefined) return;
-    // Scrubbing fires every drag tick, but a path segment spans many slider
-    // values — bail when the cursor image is unchanged so we don't restart the
-    // same thumbnail/original loads (and the 404 fallback) on every tick.
-    if (index === this.focusedIndex) return;
-    this.focusedIndex = index;
-    this.material.uniforms.uFocusedIndex.value = index;
-    const p = new THREE.Vector3();
-    if (!this.posOf(id, p)) return;
-    if (this.pathMarker) this.pathMarker.position.copy(p);
-    this.loadHiRes(index, p.clone());
-  }
-
-  clearPath() {
-    this.focusedIndex = -1;
-    if (this.material) this.material.uniforms.uFocusedIndex.value = -1;
-    this.removeHiRes();
-    if (this.pathLine) {
-      this.scene.remove(this.pathLine);
-      this.pathLine.geometry.dispose();
-      (this.pathLine.material as THREE.Material).dispose();
-      this.pathLine = null;
+  private disposeHiResSlot(slot: HiResSlot) {
+    slot.seq++;
+    this.scene.remove(slot.sprite);
+    slot.sprite.visible = false;
+    if (slot.texture) {
+      slot.texture.dispose();
+      slot.texture = null;
     }
-    if (this.pathMarker) {
-      this.scene.remove(this.pathMarker);
-      this.pathMarker.geometry.dispose();
-      (this.pathMarker.material as THREE.Material).dispose();
-      this.pathMarker = null;
+    slot.material.dispose();
+  }
+
+  private promoteIndex(index: number) {
+    if (this.hiResPool.some((s) => s.index === index)) return;
+    const slot = this.makeHiResSlot();
+    slot.index = index;
+    this.hiResPool.push(slot);
+    this.loadIntoSlot(slot);
+    this.promoteArr[index] = 1;
+  }
+
+  private demoteIndex(index: number) {
+    const i = this.hiResPool.findIndex((s) => s.index === index);
+    if (i < 0) return;
+    const [slot] = this.hiResPool.splice(i, 1);
+    this.disposeHiResSlot(slot);
+    this.promoteArr[index] = 0;
+  }
+
+  // Event-driven (called from hover changes and debounced probe queries) —
+  // never scanned per frame, so promotion adds no per-frame cost.
+  private refreshPromotionSet() {
+    const desired: number[] = [];
+    if (this.hoverIndex >= 0) desired.push(this.hoverIndex);
+    for (const idx of this.lastProbeIndices) {
+      if (desired.length >= PROBE_POOL_SIZE) break;
+      if (!desired.includes(idx)) desired.push(idx);
+    }
+    const desiredSet = new Set(desired);
+    for (const slot of [...this.hiResPool]) {
+      if (!desiredSet.has(slot.index)) this.demoteIndex(slot.index);
+    }
+    for (const idx of desired) this.promoteIndex(idx);
+    this.iPromoteAttr.needsUpdate = true;
+  }
+
+  private clearPromotions() {
+    for (const slot of [...this.hiResPool]) this.disposeHiResSlot(slot);
+    this.hiResPool = [];
+    this.promoteArr.fill(0);
+    this.iPromoteAttr.needsUpdate = true;
+  }
+
+  // Promoted (collapsed) sprites must follow displayPositions every frame so a
+  // warp drag doesn't visually separate a hi-res sprite from its dot.
+  private syncPoolPositions() {
+    for (const slot of this.hiResPool) {
+      slot.sprite.position.set(
+        this.displayPositions[slot.index * 3],
+        this.displayPositions[slot.index * 3 + 1],
+        this.displayPositions[slot.index * 3 + 2]
+      );
+    }
+  }
+
+  // ---- probe mode: live sampling --------------------------------------------
+
+  private ensureDensity() {
+    const arr = computeDensity(this.positions, this.n, DENSITY_K);
+    this.densityArr.set(arr);
+    this.iDensityAttr.needsUpdate = true;
+  }
+
+  // Point along the camera ray through (clientX, clientY) at a fixed distance
+  // equal to the current camera-to-target distance. Tracks both cursor
+  // movement (ray direction) and camera orbiting (ray origin/direction), and
+  // scales naturally with zoom. Marching a fixed distance along the ray (vs.
+  // intersecting a sphere centered on the orbit target) guarantees the probed
+  // point is always exactly that distance from the CAMERA, regardless of
+  // screen position — a target-centered sphere would sit the camera almost
+  // exactly on its own surface, so off-center (near-tangent) rays could
+  // intersect arbitrarily close to the camera and blow up billboard sizes.
+  private computeRayPoint(clientX: number, clientY: number, out: THREE.Vector3): THREE.Vector3 {
+    const rect = this.canvas.getBoundingClientRect();
+    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.tmpNdc.set(ndcX, ndcY), this.camera);
+    const dist = Math.max(this.controls.getDistance(), 0.01);
+    return out.copy(this.raycaster.ray.direction).multiplyScalar(dist).add(this.raycaster.ray.origin);
+  }
+
+  private updateProbePoint(clientX: number, clientY: number) {
+    this.computeRayPoint(clientX, clientY, this.probePoint);
+    if (this.probeMarker) this.probeMarker.position.copy(this.probePoint);
+    this.scheduleProbeQuery();
+  }
+
+  // Debounced. Layout-space k-NN only — never .vec/cosine.
+  private runProbeQuery() {
+    if (!this.probeActive || this.warpActive) return;
+    const knn = kNearestByPosition(this.positions, this.n, this.probePoint, PROBE_K);
+    this.lastProbeIndices = knn.map((r) => r.index);
+    const result = knn.map((r) => ({ id: this.items[r.index].id, dist: r.dist }));
+    const meanDist = knn.length ? knn.reduce((s, r) => s + r.dist, 0) / knn.length : 0;
+    this.refreshPromotionSet();
+    this.cb.onProbeQuery(result, meanDist);
+  }
+
+  // Public: toggle probe mode (called by React).
+  setProbeActive(active: boolean) {
+    this.probeActive = active;
+    if (this.material) this.material.uniforms.uProbeActive.value = active ? 1 : 0;
+    this.clearIdle();
+    if (active) {
+      this.ensureDensity();
+      this.controls.autoRotate = false;
+      if (this.probeMarker) this.probeMarker.visible = true;
+    } else {
+      this.scheduleProbeQuery.cancel();
+      this.lastProbeIndices = [];
+      this.clearPromotions();
+      if (this.probeMarker) this.probeMarker.visible = false;
+      if (this.warpActive) {
+        this.warpActive = false;
+        this.controls.enabled = true;
+      }
+      this.warpReleaseTween = null;
+      this.warpOffsets.fill(0);
+      this.displayPositions.set(this.positions);
+      if (this.iOffsetAttr) this.iOffsetAttr.needsUpdate = true;
+      if (this.focusedIndex < 0) this.scheduleIdle();
+    }
+  }
+
+  // ---- probe mode: drag-to-pull warp ----------------------------------------
+
+  // Falloff-weighted directional offset applied to nearby points' DISPLAY
+  // positions only — this.positions (the frozen layout) is never written.
+  private applyWarp(clientX: number, clientY: number) {
+    this.computeRayPoint(clientX, clientY, this.tmpProbe);
+    const dx = this.tmpProbe.x - this.warpCursorWorld.x;
+    const dy = this.tmpProbe.y - this.warpCursorWorld.y;
+    const dz = this.tmpProbe.z - this.warpCursorWorld.z;
+    this.warpCursorWorld.copy(this.tmpProbe);
+    if (dx === 0 && dy === 0 && dz === 0) return;
+
+    const r2 = WARP_RADIUS * WARP_RADIUS;
+    // Cap how far any single point can be pulled from its true position — a
+    // bounded "rubber band" reach. Without this, a long fast drag can fling a
+    // point arbitrarily close to the camera, where its billboard size (which
+    // scales with 1/distance) blows up to fill the screen.
+    const maxOffset = WARP_RADIUS * 1.5;
+    const maxOffset2 = maxOffset * maxOffset;
+    const ax = this.warpAnchorOrigin.x;
+    const ay = this.warpAnchorOrigin.y;
+    const az = this.warpAnchorOrigin.z;
+    for (let i = 0; i < this.n; i++) {
+      const px = this.positions[i * 3];
+      const py = this.positions[i * 3 + 1];
+      const pz = this.positions[i * 3 + 2];
+      const ddx = px - ax;
+      const ddy = py - ay;
+      const ddz = pz - az;
+      const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+      const wgt = Math.exp(-d2 / r2);
+      if (wgt < 1e-4) continue;
+      let ox = this.warpOffsets[i * 3] + dx * wgt;
+      let oy = this.warpOffsets[i * 3 + 1] + dy * wgt;
+      let oz = this.warpOffsets[i * 3 + 2] + dz * wgt;
+      const oLen2 = ox * ox + oy * oy + oz * oz;
+      if (oLen2 > maxOffset2) {
+        const scale = maxOffset / Math.sqrt(oLen2);
+        ox *= scale;
+        oy *= scale;
+        oz *= scale;
+      }
+      this.warpOffsets[i * 3] = ox;
+      this.warpOffsets[i * 3 + 1] = oy;
+      this.warpOffsets[i * 3 + 2] = oz;
+      this.displayPositions[i * 3] = px + ox;
+      this.displayPositions[i * 3 + 1] = py + oy;
+      this.displayPositions[i * 3 + 2] = pz + oz;
+    }
+    this.iOffsetAttr.needsUpdate = true;
+  }
+
+  private startWarpReleaseTween() {
+    this.warpReleaseTween = {
+      active: true,
+      start: performance.now(),
+      from: this.warpOffsets.slice(),
+    };
+  }
+
+  private stepWarpRelease(now: number) {
+    const tw = this.warpReleaseTween;
+    if (!tw) return;
+    const t = Math.min(1, (now - tw.start) / WARP_RELEASE_MS);
+    const e = easeInOutCubic(t);
+    for (let i = 0; i < this.warpOffsets.length; i++) {
+      const v = tw.from[i] * (1 - e);
+      this.warpOffsets[i] = v;
+      this.displayPositions[i] = this.positions[i] + v;
+    }
+    this.iOffsetAttr.needsUpdate = true;
+    if (t >= 1) {
+      this.warpOffsets.fill(0);
+      this.displayPositions.set(this.positions);
+      this.iOffsetAttr.needsUpdate = true;
+      this.warpReleaseTween = null;
     }
   }
 
@@ -631,7 +915,7 @@ class NavigatorScene {
   private scheduleIdle() {
     this.clearIdle();
     this.idleTimer = window.setTimeout(() => {
-      if (!this.disposed && this.focusedIndex < 0 && !this.tween.active) {
+      if (!this.disposed && this.focusedIndex < 0 && !this.probeActive && !this.tween.active) {
         this.controls.autoRotate = true;
       }
     }, IDLE_MS);
@@ -647,10 +931,12 @@ class NavigatorScene {
   private onControlsStart() {
     this.controls.autoRotate = false;
     this.clearIdle();
+    this.orbiting = true;
   }
 
   private onControlsEnd() {
-    if (this.focusedIndex < 0) this.scheduleIdle();
+    this.orbiting = false;
+    if (this.focusedIndex < 0 && !this.probeActive) this.scheduleIdle();
   }
 
   // ---- picking -------------------------------------------------------------
@@ -663,13 +949,14 @@ class NavigatorScene {
     const H = rect.height;
     const projScale = H / (2 * Math.tan((FOV * Math.PI) / 180 / 2));
 
-    // The focused hi-res sprite takes click priority so its image never resets.
+    // The focused hi-res sprite (explore mode) takes click priority so its
+    // image never resets.
     if (this.focusedIndex >= 0) {
       const i = this.focusedIndex;
       this.tmpV.set(
-        this.positions[i * 3],
-        this.positions[i * 3 + 1],
-        this.positions[i * 3 + 2]
+        this.displayPositions[i * 3],
+        this.displayPositions[i * 3 + 1],
+        this.displayPositions[i * 3 + 2]
       );
       const dist = this.camera.position.distanceTo(this.tmpV);
       this.tmpV.project(this.camera);
@@ -682,14 +969,42 @@ class NavigatorScene {
       }
     }
 
+    // Probe-mode promoted instances: hit-test their hi-res sprite bounds (the
+    // instanced quad is collapsed to zero while promoted).
+    if (this.probeActive && this.hiResPool.length > 0) {
+      let promotedBest = -1;
+      let promotedBestDist = Infinity;
+      for (const slot of this.hiResPool) {
+        const i = slot.index;
+        this.tmpV.set(
+          this.displayPositions[i * 3],
+          this.displayPositions[i * 3 + 1],
+          this.displayPositions[i * 3 + 2]
+        );
+        const dist = this.camera.position.distanceTo(this.tmpV);
+        this.tmpV.project(this.camera);
+        if (this.tmpV.z > 1) continue;
+        const sx = (this.tmpV.x * 0.5 + 0.5) * W;
+        const sy = (-this.tmpV.y * 0.5 + 0.5) * H;
+        const halfH = (PROBE_SPRITE_SIZE / 2 / dist) * projScale;
+        const halfW = halfH * Math.max(1, this.aspects[i]);
+        if (Math.abs(px - sx) <= halfW && Math.abs(py - sy) <= halfH && dist < promotedBestDist) {
+          promotedBestDist = dist;
+          promotedBest = i;
+        }
+      }
+      if (promotedBest >= 0) return promotedBest;
+    }
+
     let best = -1;
     let bestDist = Infinity;
     for (let i = 0; i < this.n; i++) {
       if (i === this.focusedIndex) continue;
+      if (this.probeActive && this.promoteArr[i] > 0.5) continue; // handled above
       this.tmpV.set(
-        this.positions[i * 3],
-        this.positions[i * 3 + 1],
-        this.positions[i * 3 + 2]
+        this.displayPositions[i * 3],
+        this.displayPositions[i * 3 + 1],
+        this.displayPositions[i * 3 + 2]
       );
       const dist = this.camera.position.distanceTo(this.tmpV);
       this.tmpV.project(this.camera);
@@ -697,7 +1012,8 @@ class NavigatorScene {
       const sx = (this.tmpV.x * 0.5 + 0.5) * W;
       const sy = (-this.tmpV.y * 0.5 + 0.5) * H;
       const gain = 1 + DIST_GAIN * Math.min(2, dist / OVERVIEW_DIST);
-      const halfH = ((BASE_SIZE * gain) / 2 / dist) * projScale;
+      let halfH = ((BASE_SIZE * gain) / 2 / dist) * projScale;
+      if (this.probeActive) halfH *= PROBE_BASE_SCALE; // match the shrunk at-rest size
       const halfW = halfH * this.aspects[i];
       if (Math.abs(px - sx) <= halfW && Math.abs(py - sy) <= halfH) {
         if (dist < bestDist) {
@@ -714,14 +1030,47 @@ class NavigatorScene {
     if (idx !== this.hoverIndex) {
       this.hoverIndex = idx;
       this.canvas.style.cursor = idx >= 0 ? "pointer" : "default";
+      if (this.probeActive) this.refreshPromotionSet();
+    }
+    if (this.probeActive) {
+      this.lastClientX = e.clientX;
+      this.lastClientY = e.clientY;
+      if (this.warpActive) {
+        this.applyWarp(e.clientX, e.clientY);
+      } else {
+        this.updateProbePoint(e.clientX, e.clientY);
+      }
     }
   }
 
   private onPointerDown(e: PointerEvent) {
     this.down = { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId };
+    if (this.probeActive) {
+      const idx = this.pickAt(e.clientX, e.clientY);
+      if (idx >= 0) {
+        this.warpActive = true;
+        this.warpAnchorIndex = idx;
+        this.warpAnchorOrigin.set(
+          this.positions[idx * 3],
+          this.positions[idx * 3 + 1],
+          this.positions[idx * 3 + 2]
+        );
+        this.computeRayPoint(e.clientX, e.clientY, this.warpCursorWorld);
+        this.controls.enabled = false;
+        if (this.warpReleaseTween) this.warpReleaseTween.active = false;
+      }
+    }
   }
 
   private onPointerUp(e: PointerEvent) {
+    if (this.warpActive) {
+      this.warpActive = false;
+      this.warpAnchorIndex = -1;
+      this.controls.enabled = true;
+      this.startWarpReleaseTween();
+      this.down = null;
+      return; // a warp release is never also a click
+    }
     const d = this.down;
     this.down = null;
     if (!d || d.id !== e.pointerId) return;
@@ -746,6 +1095,7 @@ class NavigatorScene {
     this.disposed = true;
     if (this.raf) cancelAnimationFrame(this.raf);
     this.clearIdle();
+    this.scheduleProbeQuery?.cancel();
     this.canvas.removeEventListener("pointermove", this.onPointerMove);
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
@@ -754,14 +1104,13 @@ class NavigatorScene {
       this.controls.removeEventListener("end", this.onControlsEnd);
       this.controls.dispose();
     }
-    if (this.pathLine) {
-      this.pathLine.geometry.dispose();
-      (this.pathLine.material as THREE.Material).dispose();
+    if (this.probeMarker) {
+      this.scene.remove(this.probeMarker);
+      this.probeMarker.geometry.dispose();
+      (this.probeMarker.material as THREE.Material).dispose();
     }
-    if (this.pathMarker) {
-      this.pathMarker.geometry.dispose();
-      (this.pathMarker.material as THREE.Material).dispose();
-    }
+    for (const slot of this.hiResPool) this.disposeHiResSlot(slot);
+    this.hiResPool = [];
     this.geometry?.dispose();
     this.material?.dispose();
     this.atlasTexture?.dispose();
@@ -787,14 +1136,11 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [neighbors, setNeighbors] = useState<Neighbor[]>([]);
 
-  // Latent-space slider state.
-  type Mode = "explore" | "pickA" | "pickB" | "slider";
+  // Probe mode state.
+  type Mode = "explore" | "probe";
   const [mode, setMode] = useState<Mode>("explore");
-  const [endpointA, setEndpointA] = useState<string | null>(null);
-  const [endpointB, setEndpointB] = useState<string | null>(null);
-  const [pathStops, setPathStops] = useState<PathStop[]>([]);
-  const [t, setT] = useState(0);
-  const [currentId, setCurrentId] = useState<string | null>(null);
+  const [probeNeighbors, setProbeNeighbors] = useState<{ id: string; dist: number }[]>([]);
+  const [probeMeanDist, setProbeMeanDist] = useState(0);
 
   const byId = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
   const historyRef = useRef<string[]>([]);
@@ -806,8 +1152,6 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   neighborsRef.current = neighbors;
   const modeRef = useRef<Mode>(mode);
   modeRef.current = mode;
-  const endpointARef = useRef<string | null>(endpointA);
-  endpointARef.current = endpointA;
 
   const focusOn = useCallback(
     (id: string, pushHistory: boolean) => {
@@ -844,73 +1188,22 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     else resetView();
   }, [focusOn, resetView]);
 
-  // ---- latent-space slider -------------------------------------------------
+  // ---- probe mode ------------------------------------------------------------
 
-  // Apply a slider position: pick the chain image whose segment covers t (the
-  // last stop with tStart ≤ t) and park the 3D cursor on it. The walk is the
-  // source of truth — t just scrubs along the precomputed A→B chain.
-  const applyT = useCallback(
-    (tv: number) => {
-      setT(tv);
-      if (pathStops.length === 0) return;
-      let stop = pathStops[0];
-      for (const s of pathStops) {
-        if (s.tStart <= tv) stop = s;
-      }
-      setCurrentId(stop.id);
-      sceneRef.current?.setPathCursor(stop.id);
-    },
-    [pathStops]
-  );
-
-  const startInterpolate = useCallback(() => {
+  const enterProbe = useCallback(() => {
     resetView(); // drop any focused image so we start from a clean cloud
-    setMode("pickA");
-    setEndpointA(null);
-    setEndpointB(null);
-    setPathStops([]);
-    setCurrentId(null);
-    setT(0);
+    setMode("probe");
+    setProbeNeighbors([]);
+    setProbeMeanDist(0);
+    sceneRef.current?.setProbeActive(true);
   }, [resetView]);
 
-  const exitInterpolate = useCallback(() => {
+  const exitProbe = useCallback(() => {
     setMode("explore");
-    setEndpointA(null);
-    setEndpointB(null);
-    setPathStops([]);
-    setCurrentId(null);
-    setT(0);
-    sceneRef.current?.clearPath();
+    setProbeNeighbors([]);
+    setProbeMeanDist(0);
+    sceneRef.current?.setProbeActive(false);
   }, []);
-
-  // Click handler while picking endpoints (wired into the scene's onPick).
-  const handlePick = useCallback(
-    (id: string) => {
-      const m = modeRef.current;
-      if (m === "pickA") {
-        setEndpointA(id);
-        setMode("pickB");
-      } else if (m === "pickB") {
-        const aId = endpointARef.current;
-        if (!aId || aId === id) return; // need a distinct endpoint B
-        const a = byId.get(aId);
-        const b = byId.get(id);
-        if (!a || !b) return;
-        setEndpointB(id);
-        const stops = buildWalk(items, aId, id);
-        setPathStops(stops);
-        sceneRef.current?.setPath(stops.map((s) => s.id));
-        setMode("slider");
-        // Anchor the slider at t=0 → A.
-        setT(0);
-        setCurrentId(aId);
-        sceneRef.current?.setPathCursor(aId);
-      }
-    },
-    [byId, items]
-  );
-  const handlePickRef = useRef(handlePick);
-  handlePickRef.current = handlePick;
 
   // Build the scene once on mount.
   useEffect(() => {
@@ -918,17 +1211,16 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     if (!canvas) return;
     const scene = new NavigatorScene(canvas, items, {
       onPick: (id) => {
-        const m = modeRef.current;
-        if (m === "pickA" || m === "pickB") {
-          if (id !== null) handlePickRef.current(id);
-          return;
-        }
-        if (m === "slider") return; // scrub with the slider, not by clicking
+        if (modeRef.current !== "explore") return;
         if (id === null) {
           if (focusedIdRef.current) resetView();
         } else if (id !== focusedIdRef.current) {
           focusOn(id, true);
         }
+      },
+      onProbeQuery: (result, meanDist) => {
+        setProbeNeighbors(result);
+        setProbeMeanDist(meanDist);
       },
     });
     sceneRef.current = scene;
@@ -948,26 +1240,16 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Keyboard: ←/→ walk neighbors, Esc exits focus then the overlay.
+  // Keyboard: ←/→ walk neighbors, Esc exits probe/focus/overlay.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (modeRef.current !== "explore") exitInterpolate();
+        if (modeRef.current === "probe") exitProbe();
         else if (focusedIdRef.current) resetView();
         else onExit();
         return;
       }
-      // In slider mode, arrows nudge the position along the arc.
-      if (modeRef.current === "slider") {
-        if (e.key === "ArrowRight") {
-          e.preventDefault();
-          applyT(Math.min(1, t + 0.02));
-        } else if (e.key === "ArrowLeft") {
-          e.preventDefault();
-          applyT(Math.max(0, t - 0.02));
-        }
-        return;
-      }
+      if (modeRef.current === "probe") return; // arrow-stepping is an explore-only affordance
       if (!focusedIdRef.current) return;
       if (e.key === "ArrowRight") {
         e.preventDefault();
@@ -979,7 +1261,7 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onExit, resetView, stepForward, stepBack, exitInterpolate, applyT, t]);
+  }, [onExit, resetView, stepForward, stepBack, exitProbe]);
 
   // Touch swipe through the strip when focused.
   const touchStartX = useRef<number | null>(null);
@@ -999,6 +1281,16 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     else stepBack();
   };
 
+  // Probe preview panel: cross-faded thumbnail stack weighted by inverse
+  // distance, with density-driven blur/saturation/noise (reuses the same k-NN
+  // query — no second computation).
+  const probeWeights = useMemo(() => {
+    const w = probeNeighbors.map((nb) => 1 / (1 + nb.dist));
+    const maxW = Math.max(1e-6, ...w);
+    return w.map((v) => v / maxW);
+  }, [probeNeighbors]);
+  const probeSparsity = Math.max(0, Math.min(1, probeMeanDist / (LAYOUT_RADIUS * 0.18)));
+
   return (
     <div className="navigator-overlay" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <canvas ref={canvasRef} className="navigator-canvas" />
@@ -1007,24 +1299,24 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         ✕
       </button>
 
-      {/* Top toolbar: enter / leave the latent-space slider. */}
+      {/* Top toolbar: enter / leave probe mode. */}
       {!loading && (
         <div className="navigator-toolbar">
           {mode === "explore" ? (
             <button
-              className="navigator-interp-btn"
-              onClick={startInterpolate}
-              title="Slide along the arc between two images"
+              className="navigator-probe-btn"
+              onClick={enterProbe}
+              title="Probe the cloud as an interactive point-cloud instrument"
             >
-              ⇄ Interpolate
+              ◎ Probe
             </button>
           ) : (
             <button
-              className="navigator-interp-btn active"
-              onClick={exitInterpolate}
-              title="Exit interpolate mode (Esc)"
+              className="navigator-probe-btn active"
+              onClick={exitProbe}
+              title="Exit probe mode (Esc)"
             >
-              ✕ Exit interpolate
+              ✕ Exit probe
             </button>
           )}
         </div>
@@ -1043,11 +1335,9 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         </div>
       )}
 
-      {!loading && (mode === "pickA" || mode === "pickB") && (
+      {!loading && mode === "probe" && (
         <div className="navigator-hint">
-          {mode === "pickA"
-            ? "Pick a start image — click anywhere in the cloud"
-            : "Pick an end image — the slider walks the arc between them"}
+          Move to probe the cloud · drag a point to pull its neighbors · release to snap back
         </div>
       )}
 
@@ -1070,81 +1360,34 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         </div>
       )}
 
-      {/* Latent-space slider panel. */}
-      {mode === "slider" && endpointA && endpointB && (() => {
-        const aImg = byId.get(endpointA);
-        const bImg = byId.get(endpointB);
-        const curImg = currentId ? byId.get(currentId) : null;
-        // The active stop = last stop whose segment has started.
-        let activeStop = 0;
-        for (let i = 0; i < pathStops.length; i++) {
-          if (pathStops[i].tStart <= t) activeStop = i;
-        }
-        // How the current image relates to each endpoint (cosine = dot on unit vecs).
-        const simA = curImg && aImg ? dot(curImg.vec, aImg.vec) : 0;
-        const simB = curImg && bImg ? dot(curImg.vec, bImg.vec) : 0;
-        return (
-          <div className="navigator-slider-panel">
-            <div className="navigator-slider-readout">
-              {curImg && <span className="dot" />}
-              step {activeStop + 1} / {pathStops.length} · similarity to A{" "}
-              {simA.toFixed(2)} · to B {simB.toFixed(2)}
-            </div>
-
-            <div className="navigator-slider-row">
-              {aImg && (
-                <button
-                  className={`navigator-endpoint ${t === 0 ? "live" : ""}`}
-                  onClick={() => applyT(0)}
-                  title="Endpoint A (t=0)"
-                >
-                  <img src={aImg.thumb} alt="" draggable={false} />
-                  <span>A</span>
-                </button>
-              )}
-
-              <input
-                className="navigator-slider"
-                type="range"
-                min={0}
-                max={1000}
-                value={Math.round(t * 1000)}
-                onChange={(e) => applyT(Number(e.target.value) / 1000)}
-              />
-
-              {bImg && (
-                <button
-                  className={`navigator-endpoint ${t === 1 ? "live" : ""}`}
-                  onClick={() => applyT(1)}
-                  title="Endpoint B (t=1)"
-                >
-                  <img src={bImg.thumb} alt="" draggable={false} />
-                  <span>B</span>
-                </button>
-              )}
-            </div>
-
-            {pathStops.length > 0 && (
-              <div className="navigator-pathstrip">
-                {pathStops.map((stop, i) => {
-                  const img = byId.get(stop.id);
-                  if (!img) return null;
-                  return (
-                    <button
-                      key={`${stop.id}-${i}`}
-                      className={`navigator-pathstrip-item ${i === activeStop ? "active" : ""}`}
-                      onClick={() => applyT(stop.tStart)}
-                      title={`t≈${stop.tStart.toFixed(2)}`}
-                    >
-                      <img src={img.thumb} alt="" draggable={false} />
-                    </button>
-                  );
-                })}
-              </div>
-            )}
+      {mode === "probe" && probeNeighbors.length > 0 && (
+        <div
+          className="navigator-probe-panel"
+          style={
+            {
+              filter: `blur(${(probeSparsity * 3).toFixed(2)}px) saturate(${(1 - probeSparsity * 0.6).toFixed(2)})`,
+              "--noise-opacity": probeSparsity * 0.5,
+            } as React.CSSProperties
+          }
+        >
+          <div className="navigator-probe-stack">
+            {probeNeighbors.map((nb, i) => {
+              const img = byId.get(nb.id);
+              if (!img) return null;
+              return (
+                <img
+                  key={nb.id}
+                  className="navigator-probe-layer"
+                  src={img.thumb}
+                  alt=""
+                  draggable={false}
+                  style={{ opacity: probeWeights[i] * (1 - i * 0.06), zIndex: probeNeighbors.length - i }}
+                />
+              );
+            })}
           </div>
-        );
-      })()}
+        </div>
+      )}
     </div>
   );
 }
