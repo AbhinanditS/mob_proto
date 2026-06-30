@@ -110,15 +110,19 @@ export function getNeighbors(
 }
 
 // ---------------------------------------------------------------------------
-// Latent-space slider — a coherent WALK from A to B across the real images.
+// Latent-space slider — a coherent PATH from A to B across the real images.
 //
 // We deliberately do NOT sample the straight geodesic and snap to the nearest
 // image: on a sparse set that line runs through empty space, so its "nearest"
 // images relate to nothing (they're just the least-far point to an empty spot).
-// Instead each step hops to a near-neighbor of the CURRENT image — so every
-// image shown is genuinely similar to the one before it — drifting toward B.
-// The chain always reaches B. Like getNeighbors, the math is pure .vec space
-// (full 768-D, cosine via dot); the renderer separately reads the layout array.
+//
+// Instead we route along the data's own minimum spanning tree (edges weighted by
+// angular distance). The unique tree path between A and B is a minimum-bottleneck
+// path: it provably minimizes the LARGEST hop, so there are no jarring jumps, and
+// it threads through the dense manifold so consecutive images stay similar. This
+// is far more robust than a greedy walk, which routinely dead-ends and has to
+// jump straight to B. Like getNeighbors, the math is pure .vec space (full 768-D,
+// cosine via dot); the renderer separately reads the layout array.
 // ---------------------------------------------------------------------------
 
 export interface PathStop {
@@ -126,17 +130,54 @@ export interface PathStop {
   tStart: number; // slider position (0..1) where this image takes over
 }
 
-// Build a connected A→B chain by repeated small neighbor hops. From the current
-// image we look at its `k` nearest neighbors and, among those that move closer
-// to B than we are now, take the SMALLEST hop (the candidate most similar to the
-// current image). That keeps each transition tight while still making progress,
-// yielding a smooth walk rather than a couple of big jumps. tStart is assigned by
-// cumulative angular distance so the slider's spacing tracks real distances.
+const ANGLE = (a: Float32Array, b: Float32Array) =>
+  Math.acos(Math.max(-1, Math.min(1, dot(a, b))));
+
+// Minimum spanning tree over all items (Prim, O(n²)), edges weighted by angular
+// distance. Built once and cached for the session — it's independent of which
+// endpoints are picked, like the UMAP layout. Returned as an adjacency list.
+let mstCache: number[][] | null = null;
+let mstCacheKey = "";
+function buildMST(items: NavItem[]): number[][] {
+  const n = items.length;
+  const key = String(n);
+  if (mstCache && mstCacheKey === key) return mstCache;
+
+  const adj: number[][] = Array.from({ length: n }, () => []);
+  if (n > 1) {
+    const vec = items.map((it) => it.vec);
+    const parent = new Int32Array(n).fill(-1);
+    const inTree = new Uint8Array(n);
+    const best = new Float64Array(n).fill(Infinity);
+    best[0] = 0;
+    for (let iter = 0; iter < n; iter++) {
+      let u = -1;
+      let bd = Infinity;
+      for (let i = 0; i < n; i++) if (!inTree[i] && best[i] < bd) { bd = best[i]; u = i; }
+      if (u < 0) break;
+      inTree[u] = 1;
+      for (let v = 0; v < n; v++) {
+        if (inTree[v]) continue;
+        const w = ANGLE(vec[u], vec[v]);
+        if (w < best[v]) { best[v] = w; parent[v] = u; }
+      }
+    }
+    for (let v = 0; v < n; v++) {
+      if (parent[v] >= 0) { adj[v].push(parent[v]); adj[parent[v]].push(v); }
+    }
+  }
+  mstCache = adj;
+  mstCacheKey = key;
+  return adj;
+}
+
+// The A→B path: the unique route through the MST, found by BFS over the tree.
+// tStart is assigned by cumulative angular distance so the slider's spacing
+// tracks the real distances between consecutive images.
 export function buildWalk(
   items: NavItem[],
   aId: string,
-  bId: string,
-  k = 12
+  bId: string
 ): PathStop[] {
   const idx = new Map(items.map((it, i) => [it.id, i]));
   const A = idx.get(aId);
@@ -148,54 +189,26 @@ export function buildWalk(
     ];
   }
 
-  const vec = items.map((it) => it.vec);
-  const cos = (i: number, j: number) => dot(vec[i], vec[j]);
-  const cosB = vec.map((v) => dot(v, vec[B])); // similarity of every image to B
-
-  const seq: number[] = [A];
-  const visited = new Set<number>([A]);
-  let cur = A;
-
-  for (let guard = 0; cur !== B && guard < 200; guard++) {
-    // The k nearest unvisited neighbors of the current image.
-    const scored: Array<[number, number]> = [];
-    for (let j = 0; j < items.length; j++) {
-      if (j === cur || visited.has(j)) continue;
-      scored.push([j, cos(cur, j)]);
+  const adj = buildMST(items);
+  const parent = new Int32Array(items.length).fill(-2);
+  parent[A] = -1;
+  const queue = [A];
+  for (let h = 0; h < queue.length; h++) {
+    const u = queue[h];
+    if (u === B) break;
+    for (const v of adj[u]) {
+      if (parent[v] === -2) { parent[v] = u; queue.push(v); }
     }
-    scored.sort((x, y) => y[1] - x[1]);
-    const cand = scored.slice(0, k).map((s) => s[0]);
-
-    // B in reach → finish on it.
-    if (cand.includes(B)) {
-      seq.push(B);
-      break;
-    }
-    // Smallest hop that still moves us closer to B.
-    let best = -1;
-    let bestStep = -Infinity;
-    for (const j of cand) {
-      if (cosB[j] > cosB[cur] && cos(cur, j) > bestStep) {
-        bestStep = cos(cur, j);
-        best = j;
-      }
-    }
-    // No progressing neighbor (local maximum) → jump straight to B and stop.
-    if (best < 0) {
-      seq.push(B);
-      break;
-    }
-    seq.push(best);
-    visited.add(best);
-    cur = best;
   }
-  if (seq[seq.length - 1] !== B) seq.push(B);
 
-  // Distribute slider positions by cumulative angular distance along the chain.
+  const seq: number[] = [];
+  for (let c = B; c >= 0; c = parent[c]) seq.unshift(c); // A … B
+
+  const vec = items.map((it) => it.vec);
   const cum = [0];
   let total = 0;
   for (let i = 1; i < seq.length; i++) {
-    total += Math.acos(Math.max(-1, Math.min(1, cos(seq[i - 1], seq[i]))));
+    total += ANGLE(vec[seq[i - 1]], vec[seq[i]]);
     cum.push(total);
   }
   return seq.map((s, i) => ({
