@@ -110,120 +110,96 @@ export function getNeighbors(
 }
 
 // ---------------------------------------------------------------------------
-// Latent-space slider — slerp between two endpoints, retrieve the nearest real
-// image at each step. Like getNeighbors, the math lives entirely in .vec space
+// Latent-space slider — a coherent WALK from A to B across the real images.
+//
+// We deliberately do NOT sample the straight geodesic and snap to the nearest
+// image: on a sparse set that line runs through empty space, so its "nearest"
+// images relate to nothing (they're just the least-far point to an empty spot).
+// Instead each step hops to a near-neighbor of the CURRENT image — so every
+// image shown is genuinely similar to the one before it — drifting toward B.
+// The chain always reaches B. Like getNeighbors, the math is pure .vec space
 // (full 768-D, cosine via dot); the renderer separately reads the layout array.
 // ---------------------------------------------------------------------------
 
-// Spherical interpolation between two UNIT vectors, renormalized to be safe.
-// The embeddings live on the unit sphere, so a plain lerp would cut across the
-// chord and land off-sphere in incoherent dead space — slerp walks the geodesic
-// arc instead. t=0 returns a, t=1 returns b (exactly, up to float precision).
-export function slerp(a: Float32Array, b: Float32Array, t: number): Float32Array {
-  const n = a.length;
-  const out = new Float32Array(n);
-
-  let d = dot(a, b);
-  if (d > 1) d = 1;
-  else if (d < -1) d = -1;
-
-  const theta = Math.acos(d);
-  const sinTheta = Math.sin(theta);
-
-  // a≈b (sinTheta≈0) or antipodal a≈-b (d≈-1, arc is degenerate/undefined):
-  // fall back to a normalized lerp rather than dividing by ~0.
-  if (sinTheta < 1e-6) {
-    for (let i = 0; i < n; i++) out[i] = a[i] * (1 - t) + b[i] * t;
-  } else {
-    const s0 = Math.sin((1 - t) * theta) / sinTheta;
-    const s1 = Math.sin(t * theta) / sinTheta;
-    for (let i = 0; i < n; i++) out[i] = a[i] * s0 + b[i] * s1;
-  }
-
-  // Renormalize back onto the unit sphere (guards float drift / lerp fallback).
-  let norm = 0;
-  for (let i = 0; i < n; i++) norm += out[i] * out[i];
-  norm = Math.sqrt(norm) || 1;
-  for (let i = 0; i < n; i++) out[i] /= norm;
-  return out;
-}
-
-// Single nearest real image to queryVec by cosine over the full embedding.
-// Unlike getNeighbors this KEEPS the top match. `exclude` skips given ids — used
-// for the slider's intermediate points: on this dataset the two endpoints
-// dominate every point on the arc, so excluding A and B is what lets a genuinely
-// different real image surface in between. Returns null only for an empty set.
-export function nearestImage(
-  queryVec: Float32Array,
-  items: NavItem[],
-  exclude?: Set<string>
-): Neighbor | null {
-  let bestId = "";
-  let bestScore = -Infinity;
-  for (let i = 0; i < items.length; i++) {
-    if (exclude && exclude.has(items[i].id)) continue;
-    const s = dot(queryVec, items[i].vec);
-    if (s > bestScore) {
-      bestScore = s;
-      bestId = items[i].id;
-    }
-  }
-  return bestId ? { id: bestId, score: bestScore } : null;
-}
-
-// Top-k nearest real images to queryVec by cosine, ranked, keeping the top match
-// (`exclude` skips given ids). Drives the live "neighbors of this arc point"
-// strip while scrubbing. Distinct from getNeighbors, which drops the #1 hit.
-export function topNeighbors(
-  queryVec: Float32Array,
-  items: NavItem[],
-  k: number,
-  exclude?: Set<string>
-): Neighbor[] {
-  const scored: Neighbor[] = [];
-  for (let i = 0; i < items.length; i++) {
-    if (exclude && exclude.has(items[i].id)) continue;
-    scored.push({ id: items[i].id, score: dot(queryVec, items[i].vec) });
-  }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, k);
-}
-
 export interface PathStop {
   id: string;
-  tStart: number; // the t at which this image first becomes the nearest
+  tStart: number; // slider position (0..1) where this image takes over
 }
 
-// Walk the geodesic from A to B in `steps` samples, recording the ordered set of
-// DISTINCT real images the slider surfaces along the way. The endpoints are
-// pinned (t=0 → A, t=1 → B); strictly-interior samples take the nearest image
-// EXCLUDING A and B, so the path is the actual sequence of in-between discoveries
-// rather than a bare A→B crossfade. Drives the 3D polyline and the filmstrip.
-export function computePath(
-  a: Float32Array,
-  b: Float32Array,
+// Build a connected A→B chain by repeated small neighbor hops. From the current
+// image we look at its `k` nearest neighbors and, among those that move closer
+// to B than we are now, take the SMALLEST hop (the candidate most similar to the
+// current image). That keeps each transition tight while still making progress,
+// yielding a smooth walk rather than a couple of big jumps. tStart is assigned by
+// cumulative angular distance so the slider's spacing tracks real distances.
+export function buildWalk(
   items: NavItem[],
   aId: string,
   bId: string,
-  steps = 128
+  k = 12
 ): PathStop[] {
-  const exclude = new Set([aId, bId]);
-  const stops: PathStop[] = [];
-  let lastId = "";
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    let id: string;
-    if (i === 0) id = aId;
-    else if (i === steps) id = bId;
-    else {
-      const nb = nearestImage(slerp(a, b, t), items, exclude);
-      if (!nb) continue;
-      id = nb.id;
-    }
-    if (id !== lastId) {
-      stops.push({ id, tStart: t });
-      lastId = id;
-    }
+  const idx = new Map(items.map((it, i) => [it.id, i]));
+  const A = idx.get(aId);
+  const B = idx.get(bId);
+  if (A === undefined || B === undefined || A === B) {
+    return [
+      { id: aId, tStart: 0 },
+      { id: bId, tStart: 1 },
+    ];
   }
-  return stops;
+
+  const vec = items.map((it) => it.vec);
+  const cos = (i: number, j: number) => dot(vec[i], vec[j]);
+  const cosB = vec.map((v) => dot(v, vec[B])); // similarity of every image to B
+
+  const seq: number[] = [A];
+  const visited = new Set<number>([A]);
+  let cur = A;
+
+  for (let guard = 0; cur !== B && guard < 200; guard++) {
+    // The k nearest unvisited neighbors of the current image.
+    const scored: Array<[number, number]> = [];
+    for (let j = 0; j < items.length; j++) {
+      if (j === cur || visited.has(j)) continue;
+      scored.push([j, cos(cur, j)]);
+    }
+    scored.sort((x, y) => y[1] - x[1]);
+    const cand = scored.slice(0, k).map((s) => s[0]);
+
+    // B in reach → finish on it.
+    if (cand.includes(B)) {
+      seq.push(B);
+      break;
+    }
+    // Smallest hop that still moves us closer to B.
+    let best = -1;
+    let bestStep = -Infinity;
+    for (const j of cand) {
+      if (cosB[j] > cosB[cur] && cos(cur, j) > bestStep) {
+        bestStep = cos(cur, j);
+        best = j;
+      }
+    }
+    // No progressing neighbor (local maximum) → jump straight to B and stop.
+    if (best < 0) {
+      seq.push(B);
+      break;
+    }
+    seq.push(best);
+    visited.add(best);
+    cur = best;
+  }
+  if (seq[seq.length - 1] !== B) seq.push(B);
+
+  // Distribute slider positions by cumulative angular distance along the chain.
+  const cum = [0];
+  let total = 0;
+  for (let i = 1; i < seq.length; i++) {
+    total += Math.acos(Math.max(-1, Math.min(1, cos(seq[i - 1], seq[i]))));
+    cum.push(total);
+  }
+  return seq.map((s, i) => ({
+    id: items[s].id,
+    tStart: total > 0 ? cum[i] / total : i / Math.max(1, seq.length - 1),
+  }));
 }
