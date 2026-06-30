@@ -712,3 +712,235 @@ body, html {
   width: auto;
   object-fit: cover;
 }
+
+/* ---- latent-space slider ------------------------------------------------- */
+
+.navigator-toolbar {
+  position: absolute;
+  top: 16px;
+  left: 18px;
+  z-index: 3;
+  display: flex;
+  gap: 8px;
+}
+
+.navigator-interp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 17px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(20, 20, 20, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 0.8rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.navigator-interp-btn:hover {
+  background: rgba(40, 40, 40, 0.85);
+  color: #fff;
+}
+
+.navigator-interp-btn.active {
+  border-color: rgba(255, 255, 255, 0.4);
+  color: #fff;
+}
+
+/* Bottom slider panel — endpoints, range, and the arc filmstrip. */
+.navigator-slider-panel {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 24px 22px;
+  background: linear-gradient(
+    to top,
+    rgba(5, 5, 5, 0.94) 0%,
+    rgba(5, 5, 5, 0.65) 60%,
+    rgba(5, 5, 5, 0) 100%
+  );
+  animation: navigator-strip-in 0.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.navigator-slider-readout {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.76rem;
+  letter-spacing: 0.03em;
+  color: rgba(255, 255, 255, 0.55);
+  font-variant-numeric: tabular-nums;
+}
+
+.navigator-slider-readout .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.8);
+}
+
+.navigator-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: min(720px, 92vw);
+}
+
+.navigator-endpoint {
+  position: relative;
+  flex: 0 0 auto;
+  height: 64px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #0a0a0a;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: border-color 0.18s ease, opacity 0.18s ease, transform 0.18s ease;
+}
+
+.navigator-endpoint:hover {
+  opacity: 1;
+  transform: translateY(-2px);
+}
+
+.navigator-endpoint.live {
+  border-color: rgba(255, 255, 255, 0.7);
+  opacity: 1;
+}
+
+.navigator-endpoint img {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: 96px;
+  object-fit: cover;
+}
+
+.navigator-endpoint span {
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+}
+
+.navigator-slider {
+  flex: 1 1 auto;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+  cursor: pointer;
+  outline: none;
+}
+
+.navigator-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+}
+
+.navigator-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+}
+
+.navigator-pathstrip {
+  display: flex;
+  gap: 6px;
+  max-width: min(720px, 92vw);
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.navigator-pathstrip-item {
+  flex: 0 0 auto;
+  height: 48px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  overflow: hidden;
+  background: #0a0a0a;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.navigator-pathstrip-item:hover {
+  opacity: 0.85;
+}
+
+.navigator-pathstrip-item.active {
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.7);
+  transform: translateY(-3px);
+}
+
+.navigator-pathstrip-item img {
+  display: block;
+  height: 100%;
+  width: auto;
+  object-fit: cover;
+}
+
+/* Live ranked neighbors of the current arc point (updates while scrubbing). */
+.navigator-arcstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: min(720px, 92vw);
+  height: 78px;
+}
+
+.navigator-arcstrip-item {
+  flex: 0 0 auto;
+  height: 58px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  overflow: hidden;
+  background: #0a0a0a;
+  opacity: 0.6;
+  transition: opacity 0.18s ease, height 0.18s ease, border-color 0.18s ease;
+}
+
+/* Rank #1 (= the headline shown big in 3D) reads as the dominant chip. */
+.navigator-arcstrip-item.active {
+  height: 72px;
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.75);
+}
+
+.navigator-arcstrip-item img {
+  display: block;
+  height: 100%;
+  width: auto;
+  object-fit: cover;
+}

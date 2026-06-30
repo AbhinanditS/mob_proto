@@ -14,9 +14,14 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { ConvergeImage } from "./Converge";
 import {
   computeLayout,
+  computePath,
   getNeighbors,
+  nearestImage,
+  topNeighbors,
+  slerp,
   LAYOUT_RADIUS,
   type Neighbor,
+  type PathStop,
 } from "./navigator3d";
 
 // ---------------------------------------------------------------------------
@@ -24,6 +29,7 @@ import {
 // ---------------------------------------------------------------------------
 const FOV = 50;
 const NEIGHBOR_K = 12;
+const SLIDER_K = 5; // live "neighbors of this arc point" shown while scrubbing
 const OVERVIEW_DIST = LAYOUT_RADIUS * 2.35;
 const FOCUS_DIST = LAYOUT_RADIUS * 0.34;
 const BASE_SIZE = LAYOUT_RADIUS * 0.052; // sprite full height in world units
@@ -149,6 +155,10 @@ class NavigatorScene {
   private hiResMaterial: THREE.SpriteMaterial | null = null;
   private hiResTexture: THREE.Texture | null = null;
   private hiResSeq = 0;
+
+  // Latent-space slider path: a polyline through the cloud + a cursor marker.
+  private pathLine: THREE.Line | null = null;
+  private pathMarker: THREE.Mesh | null = null;
 
   private idToIndex = new Map<string, number>();
   private n = 0;
@@ -518,6 +528,103 @@ class NavigatorScene {
     }
   }
 
+  // ---- latent-space slider path -------------------------------------------
+
+  private posOf(id: string, into: THREE.Vector3): boolean {
+    const i = this.idToIndex.get(id);
+    if (i === undefined) return false;
+    into.set(
+      this.positions[i * 3],
+      this.positions[i * 3 + 1],
+      this.positions[i * 3 + 2]
+    );
+    return true;
+  }
+
+  // Draw a polyline through the layout positions of the distinct images the arc
+  // passes through, and frame the camera once to fit it. Layout is RENDER ONLY —
+  // the path order itself comes from the full-vector slerp walk upstream.
+  setPath(ids: string[]) {
+    this.clearPath();
+    this.controls.autoRotate = false;
+    this.clearIdle();
+    if (ids.length === 0) return;
+
+    const pts: THREE.Vector3[] = [];
+    const p = new THREE.Vector3();
+    for (const id of ids) {
+      if (this.posOf(id, p)) pts.push(p.clone());
+    }
+    if (pts.length === 0) return;
+
+    if (pts.length >= 2) {
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.5,
+        depthTest: false,
+      });
+      this.pathLine = new THREE.Line(geo, mat);
+      this.pathLine.frustumCulled = false;
+      this.pathLine.renderOrder = 9;
+      this.scene.add(this.pathLine);
+    }
+
+    // Cursor marker — a small emissive sphere riding the current arc point.
+    const markerGeo = new THREE.SphereGeometry(LAYOUT_RADIUS * 0.018, 16, 16);
+    const markerMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+    });
+    this.pathMarker = new THREE.Mesh(markerGeo, markerMat);
+    this.pathMarker.renderOrder = 11;
+    this.scene.add(this.pathMarker);
+
+    // Frame the camera once to fit the path's bounding box.
+    const box = new THREE.Box3().setFromPoints(pts);
+    const center = box.getCenter(new THREE.Vector3());
+    const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, LAYOUT_RADIUS * 0.2);
+    const dir = this.camera.position.clone().sub(this.controls.target);
+    if (dir.lengthSq() < 1e-6) dir.copy(this.overviewPos);
+    dir.normalize().multiplyScalar(radius / Math.tan((FOV * Math.PI) / 180 / 2) + radius);
+    this.frameCameraTo(center.clone().add(dir), center.clone());
+  }
+
+  // Per-scrub update: park the hi-res sprite + marker on this image instantly
+  // (no camera tween — focus() would lurch on every slider tick) and collapse
+  // its instanced quad so the hi-res billboard stands in for it.
+  setPathCursor(id: string) {
+    const index = this.idToIndex.get(id);
+    if (index === undefined) return;
+    this.focusedIndex = index;
+    this.material.uniforms.uFocusedIndex.value = index;
+    const p = new THREE.Vector3();
+    if (!this.posOf(id, p)) return;
+    if (this.pathMarker) this.pathMarker.position.copy(p);
+    this.loadHiRes(index, p.clone());
+  }
+
+  clearPath() {
+    this.focusedIndex = -1;
+    if (this.material) this.material.uniforms.uFocusedIndex.value = -1;
+    this.removeHiRes();
+    if (this.pathLine) {
+      this.scene.remove(this.pathLine);
+      this.pathLine.geometry.dispose();
+      (this.pathLine.material as THREE.Material).dispose();
+      this.pathLine = null;
+    }
+    if (this.pathMarker) {
+      this.scene.remove(this.pathMarker);
+      this.pathMarker.geometry.dispose();
+      (this.pathMarker.material as THREE.Material).dispose();
+      this.pathMarker = null;
+    }
+  }
+
   // ---- idle auto-rotate ----------------------------------------------------
 
   private scheduleIdle() {
@@ -646,6 +753,14 @@ class NavigatorScene {
       this.controls.removeEventListener("end", this.onControlsEnd);
       this.controls.dispose();
     }
+    if (this.pathLine) {
+      this.pathLine.geometry.dispose();
+      (this.pathLine.material as THREE.Material).dispose();
+    }
+    if (this.pathMarker) {
+      this.pathMarker.geometry.dispose();
+      (this.pathMarker.material as THREE.Material).dispose();
+    }
     this.geometry?.dispose();
     this.material?.dispose();
     this.atlasTexture?.dispose();
@@ -671,6 +786,17 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [neighbors, setNeighbors] = useState<Neighbor[]>([]);
 
+  // Latent-space slider state.
+  type Mode = "explore" | "pickA" | "pickB" | "slider";
+  const [mode, setMode] = useState<Mode>("explore");
+  const [endpointA, setEndpointA] = useState<string | null>(null);
+  const [endpointB, setEndpointB] = useState<string | null>(null);
+  const [pathStops, setPathStops] = useState<PathStop[]>([]);
+  const [t, setT] = useState(0);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const [currentScore, setCurrentScore] = useState(1);
+  const [arcNeighbors, setArcNeighbors] = useState<Neighbor[]>([]);
+
   const byId = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
   const historyRef = useRef<string[]>([]);
 
@@ -679,6 +805,10 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   focusedIdRef.current = focusedId;
   const neighborsRef = useRef<Neighbor[]>([]);
   neighborsRef.current = neighbors;
+  const modeRef = useRef<Mode>(mode);
+  modeRef.current = mode;
+  const endpointARef = useRef<string | null>(endpointA);
+  endpointARef.current = endpointA;
 
   const focusOn = useCallback(
     (id: string, pushHistory: boolean) => {
@@ -715,12 +845,100 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     else resetView();
   }, [focusOn, resetView]);
 
+  // ---- latent-space slider -------------------------------------------------
+
+  // Apply a slider position: slerp A→B at t, retrieve the nearest REAL image on
+  // the full embedding, and park the 3D cursor on it. Endpoints are pinned
+  // (t=0 → A, t=1 → B); interior points take the nearest EXCLUDING A and B so a
+  // genuinely different image surfaces (they otherwise dominate the whole arc).
+  const applyT = useCallback(
+    (tv: number) => {
+      const a = endpointA ? byId.get(endpointA) : undefined;
+      const b = endpointB ? byId.get(endpointB) : undefined;
+      setT(tv);
+      if (!a || !b) return;
+      const q = slerp(a.vec, b.vec, tv);
+      const exclude = new Set([endpointA!, endpointB!]);
+      let nb: Neighbor | null;
+      if (tv <= 0) nb = { id: endpointA!, score: 1 };
+      else if (tv >= 1) nb = { id: endpointB!, score: 1 };
+      else nb = nearestImage(q, items, exclude);
+      if (nb) {
+        setCurrentId(nb.id);
+        setCurrentScore(nb.score);
+        sceneRef.current?.setPathCursor(nb.id);
+      }
+      // Live ranked neighbors of this exact arc point (endpoints excluded).
+      setArcNeighbors(topNeighbors(q, items, SLIDER_K, exclude));
+    },
+    [endpointA, endpointB, byId, items]
+  );
+
+  const startInterpolate = useCallback(() => {
+    resetView(); // drop any focused image so we start from a clean cloud
+    setMode("pickA");
+    setEndpointA(null);
+    setEndpointB(null);
+    setPathStops([]);
+    setCurrentId(null);
+    setArcNeighbors([]);
+    setT(0);
+  }, [resetView]);
+
+  const exitInterpolate = useCallback(() => {
+    setMode("explore");
+    setEndpointA(null);
+    setEndpointB(null);
+    setPathStops([]);
+    setCurrentId(null);
+    setArcNeighbors([]);
+    setT(0);
+    sceneRef.current?.clearPath();
+  }, []);
+
+  // Click handler while picking endpoints (wired into the scene's onPick).
+  const handlePick = useCallback(
+    (id: string) => {
+      const m = modeRef.current;
+      if (m === "pickA") {
+        setEndpointA(id);
+        setMode("pickB");
+      } else if (m === "pickB") {
+        const aId = endpointARef.current;
+        if (!aId || aId === id) return; // need a distinct endpoint B
+        const a = byId.get(aId);
+        const b = byId.get(id);
+        if (!a || !b) return;
+        setEndpointB(id);
+        const stops = computePath(a.vec, b.vec, items, aId, id);
+        setPathStops(stops);
+        sceneRef.current?.setPath(stops.map((s) => s.id));
+        setMode("slider");
+        // Anchor the slider at t=0 → A.
+        setT(0);
+        setCurrentId(aId);
+        setCurrentScore(1);
+        setArcNeighbors(topNeighbors(a.vec, items, SLIDER_K, new Set([aId, id])));
+        sceneRef.current?.setPathCursor(aId);
+      }
+    },
+    [byId, items]
+  );
+  const handlePickRef = useRef(handlePick);
+  handlePickRef.current = handlePick;
+
   // Build the scene once on mount.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const scene = new NavigatorScene(canvas, items, {
       onPick: (id) => {
+        const m = modeRef.current;
+        if (m === "pickA" || m === "pickB") {
+          if (id !== null) handlePickRef.current(id);
+          return;
+        }
+        if (m === "slider") return; // scrub with the slider, not by clicking
         if (id === null) {
           if (focusedIdRef.current) resetView();
         } else if (id !== focusedIdRef.current) {
@@ -749,8 +967,20 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (focusedIdRef.current) resetView();
+        if (modeRef.current !== "explore") exitInterpolate();
+        else if (focusedIdRef.current) resetView();
         else onExit();
+        return;
+      }
+      // In slider mode, arrows nudge the position along the arc.
+      if (modeRef.current === "slider") {
+        if (e.key === "ArrowRight") {
+          e.preventDefault();
+          applyT(Math.min(1, t + 0.02));
+        } else if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          applyT(Math.max(0, t - 0.02));
+        }
         return;
       }
       if (!focusedIdRef.current) return;
@@ -764,7 +994,7 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onExit, resetView, stepForward, stepBack]);
+  }, [onExit, resetView, stepForward, stepBack, exitInterpolate, applyT, t]);
 
   // Touch swipe through the strip when focused.
   const touchStartX = useRef<number | null>(null);
@@ -792,6 +1022,29 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         ✕
       </button>
 
+      {/* Top toolbar: enter / leave the latent-space slider. */}
+      {!loading && (
+        <div className="navigator-toolbar">
+          {mode === "explore" ? (
+            <button
+              className="navigator-interp-btn"
+              onClick={startInterpolate}
+              title="Slide along the arc between two images"
+            >
+              ⇄ Interpolate
+            </button>
+          ) : (
+            <button
+              className="navigator-interp-btn active"
+              onClick={exitInterpolate}
+              title="Exit interpolate mode (Esc)"
+            >
+              ✕ Exit interpolate
+            </button>
+          )}
+        </div>
+      )}
+
       {loading && (
         <div className="navigator-loading">
           <div className="navigator-spinner" />
@@ -799,13 +1052,21 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         </div>
       )}
 
-      {!loading && !focusedId && (
+      {!loading && mode === "explore" && !focusedId && (
         <div className="navigator-hint">
           Drag to orbit · scroll to zoom · click an image to dive in
         </div>
       )}
 
-      {focusedId && neighbors.length > 0 && (
+      {!loading && (mode === "pickA" || mode === "pickB") && (
+        <div className="navigator-hint">
+          {mode === "pickA"
+            ? "Pick a start image — click anywhere in the cloud"
+            : "Pick an end image — the slider walks the arc between them"}
+        </div>
+      )}
+
+      {mode === "explore" && focusedId && neighbors.length > 0 && (
         <div className="navigator-strip">
           {neighbors.map((nb) => {
             const img = byId.get(nb.id);
@@ -823,6 +1084,99 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
           })}
         </div>
       )}
+
+      {/* Latent-space slider panel. */}
+      {mode === "slider" && endpointA && endpointB && (() => {
+        const aImg = byId.get(endpointA);
+        const bImg = byId.get(endpointB);
+        const curImg = currentId ? byId.get(currentId) : null;
+        // The active stop = last stop whose arc segment has started.
+        let activeStop = 0;
+        for (let i = 0; i < pathStops.length; i++) {
+          if (pathStops[i].tStart <= t) activeStop = i;
+        }
+        return (
+          <div className="navigator-slider-panel">
+            <div className="navigator-slider-readout">
+              {curImg && <span className="dot" />}
+              t = {t.toFixed(2)} · nearest similarity {currentScore.toFixed(3)} ·{" "}
+              {pathStops.length} images on the arc
+            </div>
+
+            {/* Live: the images sitting closest to THIS point on the arc, ranked
+                (endpoints excluded). The #1 is the headline shown big in 3D. */}
+            {arcNeighbors.length > 0 && (
+              <div className="navigator-arcstrip">
+                {arcNeighbors.map((nb) => {
+                  const img = byId.get(nb.id);
+                  if (!img) return null;
+                  return (
+                    <div
+                      key={nb.id}
+                      className={`navigator-arcstrip-item ${nb.id === currentId ? "active" : ""}`}
+                      title={`similarity ${nb.score.toFixed(3)}`}
+                    >
+                      <img src={img.thumb} alt="" draggable={false} />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="navigator-slider-row">
+              {aImg && (
+                <button
+                  className={`navigator-endpoint ${t === 0 ? "live" : ""}`}
+                  onClick={() => applyT(0)}
+                  title="Endpoint A (t=0)"
+                >
+                  <img src={aImg.thumb} alt="" draggable={false} />
+                  <span>A</span>
+                </button>
+              )}
+
+              <input
+                className="navigator-slider"
+                type="range"
+                min={0}
+                max={1000}
+                value={Math.round(t * 1000)}
+                onChange={(e) => applyT(Number(e.target.value) / 1000)}
+              />
+
+              {bImg && (
+                <button
+                  className={`navigator-endpoint ${t === 1 ? "live" : ""}`}
+                  onClick={() => applyT(1)}
+                  title="Endpoint B (t=1)"
+                >
+                  <img src={bImg.thumb} alt="" draggable={false} />
+                  <span>B</span>
+                </button>
+              )}
+            </div>
+
+            {pathStops.length > 0 && (
+              <div className="navigator-pathstrip">
+                {pathStops.map((stop, i) => {
+                  const img = byId.get(stop.id);
+                  if (!img) return null;
+                  return (
+                    <button
+                      key={`${stop.id}-${i}`}
+                      className={`navigator-pathstrip-item ${i === activeStop ? "active" : ""}`}
+                      onClick={() => applyT(stop.tStart)}
+                      title={`t≈${stop.tStart.toFixed(2)}`}
+                    >
+                      <img src={img.thumb} alt="" draggable={false} />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
