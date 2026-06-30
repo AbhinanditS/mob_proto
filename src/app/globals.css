@@ -911,36 +911,3 @@ body, html {
   object-fit: cover;
 }
 
-/* Live ranked neighbors of the current arc point (updates while scrubbing). */
-.navigator-arcstrip {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  max-width: min(720px, 92vw);
-  height: 78px;
-}
-
-.navigator-arcstrip-item {
-  flex: 0 0 auto;
-  height: 58px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 5px;
-  overflow: hidden;
-  background: #0a0a0a;
-  opacity: 0.6;
-  transition: opacity 0.18s ease, height 0.18s ease, border-color 0.18s ease;
-}
-
-/* Rank #1 (= the headline shown big in 3D) reads as the dominant chip. */
-.navigator-arcstrip-item.active {
-  height: 72px;
-  opacity: 1;
-  border-color: rgba(255, 255, 255, 0.75);
-}
-
-.navigator-arcstrip-item img {
-  display: block;
-  height: 100%;
-  width: auto;
-  object-fit: cover;
-}

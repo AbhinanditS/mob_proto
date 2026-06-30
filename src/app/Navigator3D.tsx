@@ -12,13 +12,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { ConvergeImage } from "./Converge";
+import { dot } from "./converge";
 import {
+  buildWalk,
   computeLayout,
-  computePath,
   getNeighbors,
-  nearestImage,
-  topNeighbors,
-  slerp,
   LAYOUT_RADIUS,
   type Neighbor,
   type PathStop,
@@ -29,7 +27,6 @@ import {
 // ---------------------------------------------------------------------------
 const FOV = 50;
 const NEIGHBOR_K = 12;
-const SLIDER_K = 5; // live "neighbors of this arc point" shown while scrubbing
 const OVERVIEW_DIST = LAYOUT_RADIUS * 2.35;
 const FOCUS_DIST = LAYOUT_RADIUS * 0.34;
 const BASE_SIZE = LAYOUT_RADIUS * 0.052; // sprite full height in world units
@@ -798,8 +795,6 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
   const [pathStops, setPathStops] = useState<PathStop[]>([]);
   const [t, setT] = useState(0);
   const [currentId, setCurrentId] = useState<string | null>(null);
-  const [currentScore, setCurrentScore] = useState(1);
-  const [arcNeighbors, setArcNeighbors] = useState<Neighbor[]>([]);
 
   const byId = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
   const historyRef = useRef<string[]>([]);
@@ -851,31 +846,21 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
 
   // ---- latent-space slider -------------------------------------------------
 
-  // Apply a slider position: slerp A→B at t, retrieve the nearest REAL image on
-  // the full embedding, and park the 3D cursor on it. Endpoints are pinned
-  // (t=0 → A, t=1 → B); interior points take the nearest EXCLUDING A and B so a
-  // genuinely different image surfaces (they otherwise dominate the whole arc).
+  // Apply a slider position: pick the chain image whose segment covers t (the
+  // last stop with tStart ≤ t) and park the 3D cursor on it. The walk is the
+  // source of truth — t just scrubs along the precomputed A→B chain.
   const applyT = useCallback(
     (tv: number) => {
-      const a = endpointA ? byId.get(endpointA) : undefined;
-      const b = endpointB ? byId.get(endpointB) : undefined;
       setT(tv);
-      if (!a || !b) return;
-      const q = slerp(a.vec, b.vec, tv);
-      const exclude = new Set([endpointA!, endpointB!]);
-      let nb: Neighbor | null;
-      if (tv <= 0) nb = { id: endpointA!, score: 1 };
-      else if (tv >= 1) nb = { id: endpointB!, score: 1 };
-      else nb = nearestImage(q, items, exclude);
-      if (nb) {
-        setCurrentId(nb.id);
-        setCurrentScore(nb.score);
-        sceneRef.current?.setPathCursor(nb.id);
+      if (pathStops.length === 0) return;
+      let stop = pathStops[0];
+      for (const s of pathStops) {
+        if (s.tStart <= tv) stop = s;
       }
-      // Live ranked neighbors of this exact arc point (endpoints excluded).
-      setArcNeighbors(topNeighbors(q, items, SLIDER_K, exclude));
+      setCurrentId(stop.id);
+      sceneRef.current?.setPathCursor(stop.id);
     },
-    [endpointA, endpointB, byId, items]
+    [pathStops]
   );
 
   const startInterpolate = useCallback(() => {
@@ -885,7 +870,6 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     setEndpointB(null);
     setPathStops([]);
     setCurrentId(null);
-    setArcNeighbors([]);
     setT(0);
   }, [resetView]);
 
@@ -895,7 +879,6 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     setEndpointB(null);
     setPathStops([]);
     setCurrentId(null);
-    setArcNeighbors([]);
     setT(0);
     sceneRef.current?.clearPath();
   }, []);
@@ -914,15 +897,13 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         const b = byId.get(id);
         if (!a || !b) return;
         setEndpointB(id);
-        const stops = computePath(a.vec, b.vec, items, aId, id);
+        const stops = buildWalk(items, aId, id);
         setPathStops(stops);
         sceneRef.current?.setPath(stops.map((s) => s.id));
         setMode("slider");
         // Anchor the slider at t=0 → A.
         setT(0);
         setCurrentId(aId);
-        setCurrentScore(1);
-        setArcNeighbors(topNeighbors(a.vec, items, SLIDER_K, new Set([aId, id])));
         sceneRef.current?.setPathCursor(aId);
       }
     },
@@ -1094,38 +1075,21 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
         const aImg = byId.get(endpointA);
         const bImg = byId.get(endpointB);
         const curImg = currentId ? byId.get(currentId) : null;
-        // The active stop = last stop whose arc segment has started.
+        // The active stop = last stop whose segment has started.
         let activeStop = 0;
         for (let i = 0; i < pathStops.length; i++) {
           if (pathStops[i].tStart <= t) activeStop = i;
         }
+        // How the current image relates to each endpoint (cosine = dot on unit vecs).
+        const simA = curImg && aImg ? dot(curImg.vec, aImg.vec) : 0;
+        const simB = curImg && bImg ? dot(curImg.vec, bImg.vec) : 0;
         return (
           <div className="navigator-slider-panel">
             <div className="navigator-slider-readout">
               {curImg && <span className="dot" />}
-              t = {t.toFixed(2)} · nearest similarity {currentScore.toFixed(3)} ·{" "}
-              {pathStops.length} images on the arc
+              step {activeStop + 1} / {pathStops.length} · similarity to A{" "}
+              {simA.toFixed(2)} · to B {simB.toFixed(2)}
             </div>
-
-            {/* Live: the images sitting closest to THIS point on the arc, ranked
-                (endpoints excluded). The #1 is the headline shown big in 3D. */}
-            {arcNeighbors.length > 0 && (
-              <div className="navigator-arcstrip">
-                {arcNeighbors.map((nb) => {
-                  const img = byId.get(nb.id);
-                  if (!img) return null;
-                  return (
-                    <div
-                      key={nb.id}
-                      className={`navigator-arcstrip-item ${nb.id === currentId ? "active" : ""}`}
-                      title={`similarity ${nb.score.toFixed(3)}`}
-                    >
-                      <img src={img.thumb} alt="" draggable={false} />
-                    </div>
-                  );
-                })}
-              </div>
-            )}
 
             <div className="navigator-slider-row">
               {aImg && (
