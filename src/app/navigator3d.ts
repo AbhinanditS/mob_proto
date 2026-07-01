@@ -110,111 +110,77 @@ export function getNeighbors(
 }
 
 // ---------------------------------------------------------------------------
-// Latent-space slider — a coherent PATH from A to B across the real images.
-//
-// We deliberately do NOT sample the straight geodesic and snap to the nearest
-// image: on a sparse set that line runs through empty space, so its "nearest"
-// images relate to nothing (they're just the least-far point to an empty spot).
-//
-// Instead we route along the data's own minimum spanning tree (edges weighted by
-// angular distance). The unique tree path between A and B is a minimum-bottleneck
-// path: it provably minimizes the LARGEST hop, so there are no jarring jumps, and
-// it threads through the dense manifold so consecutive images stay similar. This
-// is far more robust than a greedy walk, which routinely dead-ends and has to
-// jump straight to B. Like getNeighbors, the math is pure .vec space (full 768-D,
-// cosine via dot); the renderer separately reads the layout array.
+// Probe mode — k-NN and density purely over the 3-D layout array (Euclidean
+// distance), never over .vec. This answers "what's near this point in the
+// RENDERED cloud," which is a distinct question from getNeighbors() above
+// ("what's near this vector in the full embedding space"). Mixing the two
+// would defeat the point: the layout has no inverse, so probing must stay in
+// layout space to make sense of arbitrary (non-image) query points.
 // ---------------------------------------------------------------------------
 
-export interface PathStop {
-  id: string;
-  tStart: number; // slider position (0..1) where this image takes over
+export interface PositionNeighbor {
+  index: number;
+  dist: number; // Euclidean distance in layout (render) space
 }
 
-const ANGLE = (a: Float32Array, b: Float32Array) =>
-  Math.acos(Math.max(-1, Math.min(1, dot(a, b))));
-
-// Minimum spanning tree over all items (Prim, O(n²)), edges weighted by angular
-// distance. Built once and cached for the session — it's independent of which
-// endpoints are picked, like the UMAP layout. Returned as an adjacency list.
-// Keyed by the items array identity (not its length): a same-length array with
-// different vectors — e.g. a re-imported embeddings.json — must rebuild the tree,
-// since the cached adjacency indexes into the specific vectors it was built from.
-let mstCache: number[][] | null = null;
-let mstCacheItems: NavItem[] | null = null;
-function buildMST(items: NavItem[]): number[][] {
-  if (mstCache && mstCacheItems === items) return mstCache;
-  const n = items.length;
-
-  const adj: number[][] = Array.from({ length: n }, () => []);
-  if (n > 1) {
-    const vec = items.map((it) => it.vec);
-    const parent = new Int32Array(n).fill(-1);
-    const inTree = new Uint8Array(n);
-    const best = new Float64Array(n).fill(Infinity);
-    best[0] = 0;
-    for (let iter = 0; iter < n; iter++) {
-      let u = -1;
-      let bd = Infinity;
-      for (let i = 0; i < n; i++) if (!inTree[i] && best[i] < bd) { bd = best[i]; u = i; }
-      if (u < 0) break;
-      inTree[u] = 1;
-      for (let v = 0; v < n; v++) {
-        if (inTree[v]) continue;
-        const w = ANGLE(vec[u], vec[v]);
-        if (w < best[v]) { best[v] = w; parent[v] = u; }
-      }
-    }
-    for (let v = 0; v < n; v++) {
-      if (parent[v] >= 0) { adj[v].push(parent[v]); adj[parent[v]].push(v); }
-    }
+// Closest points to `point` by Euclidean distance in the 3-D layout array.
+// Brute-force O(n) distance + sort; no caching (the query point changes every
+// call). Safe at gallery scale on a debounce — see Navigator3D's probe wiring.
+export function kNearestByPosition(
+  positions: Float32Array,
+  n: number,
+  point: { x: number; y: number; z: number },
+  k: number
+): PositionNeighbor[] {
+  const scored: PositionNeighbor[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const dx = positions[i * 3] - point.x;
+    const dy = positions[i * 3 + 1] - point.y;
+    const dz = positions[i * 3 + 2] - point.z;
+    scored[i] = { index: i, dist: Math.sqrt(dx * dx + dy * dy + dz * dz) };
   }
-  mstCache = adj;
-  mstCacheItems = items;
-  return adj;
+  scored.sort((a, b) => a.dist - b.dist);
+  return scored.slice(0, k);
 }
 
-// The A→B path: the unique route through the MST, found by BFS over the tree.
-// tStart is assigned by cumulative angular distance so the slider's spacing
-// tracks the real distances between consecutive images.
-export function buildWalk(
-  items: NavItem[],
-  aId: string,
-  bId: string
-): PathStop[] {
-  const idx = new Map(items.map((it, i) => [it.id, i]));
-  const A = idx.get(aId);
-  const B = idx.get(bId);
-  if (A === undefined || B === undefined || A === B) {
-    return [
-      { id: aId, tStart: 0 },
-      { id: bId, tStart: 1 },
-    ];
-  }
+// Per-point local-density scalar: mean distance to each point's k nearest
+// neighbors IN LAYOUT SPACE, normalized/inverted to [0,1] (1 = densest region,
+// 0 = sparsest). Computed once per session (O(n² log n)) and cached at module
+// scope like layoutCache — re-entering probe mode after the first time is free.
+let densityCache: Float32Array | null = null;
+let densityCacheKey = "";
 
-  const adj = buildMST(items);
-  const parent = new Int32Array(items.length).fill(-2);
-  parent[A] = -1;
-  const queue = [A];
-  for (let h = 0; h < queue.length; h++) {
-    const u = queue[h];
-    if (u === B) break;
-    for (const v of adj[u]) {
-      if (parent[v] === -2) { parent[v] = u; queue.push(v); }
+export function computeDensity(positions: Float32Array, n: number, k = 6): Float32Array {
+  const key = `${n}:${k}`;
+  if (densityCache && densityCacheKey === key) return densityCache;
+
+  const raw = new Float32Array(n);
+  const dists = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (j === i) { dists[j] = Infinity; continue; }
+      const dx = positions[i * 3] - positions[j * 3];
+      const dy = positions[i * 3 + 1] - positions[j * 3 + 1];
+      const dz = positions[i * 3 + 2] - positions[j * 3 + 2];
+      dists[j] = Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
+    const sorted = Array.from(dists).sort((a, b) => a - b);
+    let sum = 0;
+    const kk = Math.min(k, n - 1);
+    for (let t = 0; t < kk; t++) sum += sorted[t];
+    raw[i] = kk > 0 ? sum / kk : 0;
   }
 
-  const seq: number[] = [];
-  for (let c = B; c >= 0; c = parent[c]) seq.unshift(c); // A … B
-
-  const vec = items.map((it) => it.vec);
-  const cum = [0];
-  let total = 0;
-  for (let i = 1; i < seq.length; i++) {
-    total += ANGLE(vec[seq[i - 1]], vec[seq[i]]);
-    cum.push(total);
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (raw[i] < lo) lo = raw[i];
+    if (raw[i] > hi) hi = raw[i];
   }
-  return seq.map((s, i) => ({
-    id: items[s].id,
-    tStart: total > 0 ? cum[i] / total : i / Math.max(1, seq.length - 1),
-  }));
+  const out = new Float32Array(n);
+  const span = Math.max(1e-6, hi - lo);
+  for (let i = 0; i < n; i++) out[i] = 1 - (raw[i] - lo) / span;
+
+  densityCache = out;
+  densityCacheKey = key;
+  return out;
 }
