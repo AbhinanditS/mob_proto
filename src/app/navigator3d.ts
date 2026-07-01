@@ -55,8 +55,13 @@ export function computeLayout(items: NavItem[]): Float32Array {
   const X = items.map((it) => Array.from(it.vec));
   const umap = new UMAP({
     nComponents: 3,
-    nNeighbors: Math.min(15, n - 1),
+    // 15-50 is the standard UMAP guidance range; 30 weighs more toward
+    // preserving global structure than the previous low-end value.
+    nNeighbors: Math.min(30, n - 1),
     minDist: 0.1,
+    // Explicit rather than relying on umap-js's implicit size-based default —
+    // pins the convergence budget so behavior doesn't shift across versions.
+    nEpochs: 500,
     random: mulberry32(1234567),
   });
   const embedding = umap.fit(X); // number[][], n × 3

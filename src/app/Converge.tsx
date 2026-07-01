@@ -18,6 +18,7 @@ export interface ConvergeImage extends ConvergeItem {
   file: string;
   w: number;
   h: number;
+  kind?: "image" | "video";
 }
 
 interface ConvergeProps {

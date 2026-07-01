@@ -2,12 +2,11 @@ import { AutoProcessor, SiglipVisionModel, RawImage } from '@huggingface/transfo
 import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
+import { MODEL } from '../src/model';
 
 const IMAGES_DIR = path.join(process.cwd(), 'public', 'images');
 const THUMBS_DIR = path.join(process.cwd(), 'public', 'thumbs');
 const OUTPUT_FILE = path.join(process.cwd(), 'src', 'embeddings.json');
-
-const MODEL = 'Xenova/siglip-base-patch16-384';
 
 async function main() {
   console.log('Loading SigLIP model and processor...');

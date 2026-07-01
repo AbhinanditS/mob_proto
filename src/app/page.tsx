@@ -1,8 +1,9 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import type { PreTrainedTokenizer, PreTrainedModel } from "@huggingface/transformers";
+import type { PreTrainedTokenizer, PreTrainedModel, Processor, RawImage } from "@huggingface/transformers";
 import rawEmbeddings from "@/embeddings.json";
+import { MODEL } from "@/model";
 import Converge from "./Converge";
 import Navigator3D from "./Navigator3D";
 
@@ -13,6 +14,7 @@ interface ImageRecord {
   w: number;
   h: number;
   embedding: number[];
+  kind?: "image" | "video"; // undefined/omitted == "image" for the precomputed dataset
 }
 
 interface LaidOutItem extends ImageRecord {
@@ -22,9 +24,60 @@ interface LaidOutItem extends ImageRecord {
   height: number;
 }
 
-// SigLIP checkpoint — must match scripts/precompute.ts so image and text
-// embeddings live in the same vector space.
-const MODEL = "Xenova/siglip-base-patch16-384";
+const VIDEO_POSTER_SEEK_FRACTION = 0.1; // seek 10% into the clip — frame 0 is often black/blank
+
+// Extract one representative frame from a video File via an offscreen
+// <video>+<canvas> — no ffmpeg, no server round-trip. The frame is embedded
+// exactly like an uploaded image; the original video stays playable in the
+// grid via its own object URL.
+async function extractVideoPosterFrame(
+  file: File
+): Promise<{ videoUrl: string; posterBlob: Blob; w: number; h: number }> {
+  const videoUrl = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.src = videoUrl;
+  video.muted = true;
+  video.playsInline = true;
+
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error("Failed to load video metadata"));
+  });
+
+  const seekTime = Math.min(video.duration * VIDEO_POSTER_SEEK_FRACTION, video.duration || 0);
+  await new Promise<void>((resolve, reject) => {
+    video.onseeked = () => resolve();
+    video.onerror = () => reject(new Error("Failed to seek video"));
+    video.currentTime = seekTime;
+  });
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.drawImage(video, 0, 0, w, h);
+
+  const posterBlob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("Canvas toBlob failed"))),
+      "image/webp",
+      0.9
+    );
+  });
+
+  return { videoUrl, posterBlob, w, h };
+}
+
+// Precomputed dataset IDs are always "NNN_..." (filename-derived, see
+// scripts/precompute.ts) — this prefix can never collide with them.
+let uploadIdSeq = 0;
+function nextUploadId(): string {
+  uploadIdSeq += 1;
+  return `upload-${Date.now()}-${uploadIdSeq}`;
+}
 
 export default function Home() {
   const [mounted, setMounted] = useState(false);
@@ -45,21 +98,38 @@ export default function Home() {
   const [textVec, setTextVec] = useState<Float32Array | null>(null);
   const [searchStatus, setSearchStatus] = useState<string | null>(null);
 
+  // Upload state: files the user drops/picks are embedded client-side and
+  // merged into `items` for this session only — never written to disk, gone
+  // on refresh.
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+
   const helpRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   // Cache the lazily-loaded tokenizer + text model so only the first search
   // pays the load/download cost.
   const textModelRef = useRef<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel } | null>(null);
+  // Same lazy-load-once pattern for embedding uploaded images/video frames.
+  const visionModelRef = useRef<{ processor: Processor; model: PreTrainedModel } | null>(null);
   // Monotonic token to invalidate in-flight searches when the user clears the
   // box, submits a new query, or clicks away before the previous one resolves.
   const searchSeqRef = useRef(0);
+  // Same pattern for uploads: dropping a new batch while a previous one is
+  // still embedding invalidates the stale batch's in-flight loop.
+  const uploadSeqRef = useRef(0);
+  // Counts nested dragenter/dragleave (fired on every child element under the
+  // cursor) so the drop-zone overlay only toggles on the outermost enter/leave.
+  const dragCounterRef = useRef(0);
 
-  // Parse items and cache their Float32Array embeddings
-  const items = useMemo(() => {
-    return (rawEmbeddings as ImageRecord[]).map(item => ({
+  // Items: the precomputed dataset, plus anything dropped in this session.
+  // Lazy initializer preserves the old useMemo's "compute once" semantics for
+  // the static import, while making the array appendable via setItems.
+  const [items, setItems] = useState<(ImageRecord & { vec: Float32Array })[]>(() =>
+    (rawEmbeddings as ImageRecord[]).map(item => ({
       ...item,
-      vec: new Float32Array(item.embedding)
-    }));
-  }, []);
+      vec: new Float32Array(item.embedding),
+    }))
+  );
 
   // Map for fast O(1) retrieval by ID
   const byId = useMemo(() => {
@@ -308,6 +378,123 @@ export default function Home() {
     setSearchStatus(null);
   };
 
+  // Embed one already-loaded RawImage with SigLIP's vision tower (client-side,
+  // lazy — mirrors runTextSearch's load-once-and-cache pattern above).
+  const embedRawImage = async (raw: RawImage): Promise<Float32Array> => {
+    let cached = visionModelRef.current;
+    if (!cached) {
+      const { AutoProcessor, SiglipVisionModel, env } = await import("@huggingface/transformers");
+      env.allowLocalModels = false;
+      const processor = await AutoProcessor.from_pretrained(MODEL);
+      const model = await SiglipVisionModel.from_pretrained(MODEL, { dtype: "q8" });
+      cached = { processor, model };
+      visionModelRef.current = cached;
+    }
+    const inputs = await cached.processor(raw);
+    const { pooler_output } = await cached.model(inputs);
+    const v = Array.from(pooler_output.data as Float32Array);
+    const norm = Math.hypot(...v) || 1;
+    return new Float32Array(v.map(x => x / norm));
+  };
+
+  // Embed dropped/picked files client-side and merge them into `items`.
+  // Images embed directly; videos get a representative frame extracted first
+  // (extractVideoPosterFrame) and that frame is embedded the same way. Files
+  // are processed sequentially, not concurrently — ONNX Runtime Web inference
+  // is CPU-bound and largely serializes anyway, and sequential keeps the
+  // done/total progress readout exact without a concurrency-pool utility.
+  const ingestFiles = async (files: File[]) => {
+    const seq = ++uploadSeqRef.current;
+    const imageFiles = files.filter(f => f.type.startsWith("image/"));
+    const videoFiles = files.filter(f => f.type.startsWith("video/"));
+    const total = imageFiles.length + videoFiles.length;
+    if (total === 0) return;
+
+    const { RawImage } = await import("@huggingface/transformers");
+    let done = 0;
+    setUploadStatus(`Embedding 0 / ${total}…`);
+    const newRecords: (ImageRecord & { vec: Float32Array })[] = [];
+
+    try {
+      for (const file of imageFiles) {
+        if (uploadSeqRef.current !== seq) return;
+        const objectUrl = URL.createObjectURL(file);
+        const raw = await RawImage.fromURL(objectUrl);
+        const vec = await embedRawImage(raw);
+        newRecords.push({
+          id: nextUploadId(),
+          file: objectUrl,
+          thumb: objectUrl,
+          w: raw.width,
+          h: raw.height,
+          embedding: Array.from(vec),
+          vec,
+          kind: "image",
+        });
+        done++;
+        setUploadStatus(`Embedding ${done} / ${total}…`);
+      }
+
+      for (const file of videoFiles) {
+        if (uploadSeqRef.current !== seq) return;
+        const { videoUrl, posterBlob, w, h } = await extractVideoPosterFrame(file);
+        const posterUrl = URL.createObjectURL(posterBlob);
+        const raw = await RawImage.fromBlob(posterBlob);
+        const vec = await embedRawImage(raw);
+        newRecords.push({
+          id: nextUploadId(),
+          file: videoUrl,
+          thumb: posterUrl,
+          w,
+          h,
+          embedding: Array.from(vec),
+          vec,
+          kind: "video",
+        });
+        done++;
+        setUploadStatus(`Embedding ${done} / ${total}…`);
+      }
+
+      if (uploadSeqRef.current !== seq) return;
+      setItems(prev => [...prev, ...newRecords]);
+      setUploadStatus(null);
+    } catch (err) {
+      console.error("Upload embedding failed:", err);
+      if (uploadSeqRef.current === seq) setUploadStatus("Upload failed");
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer.types.includes("Files")) {
+      dragCounterRef.current += 1;
+      setIsDraggingFile(true);
+    }
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0;
+      setIsDraggingFile(false);
+    }
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounterRef.current = 0;
+    setIsDraggingFile(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) ingestFiles(files);
+  };
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    if (files.length > 0) ingestFiles(files);
+    e.target.value = "";
+  };
+
   // Right click (open original image in new tab)
   const handleImageRightClick = (e: React.MouseEvent, fileUrl: string) => {
     e.preventDefault();
@@ -341,14 +528,24 @@ export default function Home() {
     return <div className="w-screen h-screen bg-black" />;
   }
 
-  // Developer/Empty state warning
+  // Developer/Empty state warning — also a drop target, so a first-time user
+  // with no precomputed dataset can start populating the gallery immediately.
   if (items.length === 0) {
     return (
-      <div className="w-screen h-screen bg-[#050505] flex flex-col items-center justify-center p-8 text-center">
+      <div
+        className="w-screen h-screen bg-[#050505] flex flex-col items-center justify-center p-8 text-center"
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
         <div className="max-w-md bg-neutral-900 border border-neutral-800 p-8 rounded-2xl shadow-2xl backdrop-blur-md">
           <h2 className="text-xl font-semibold mb-4 text-white">Welcome to River</h2>
           <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
-            The dataset is currently empty. Drop your image files (JPEG, PNG, WebP) into:
+            Drag and drop images or videos here to try it out instantly — added for this session only.
+          </p>
+          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
+            To build a permanent dataset instead, drop your image files (JPEG, PNG, WebP) into:
           </p>
           <code className="block bg-black text-emerald-400 p-3 rounded-lg text-xs font-mono mb-6 border border-neutral-800 text-left select-all">
             public/images/
@@ -363,12 +560,29 @@ export default function Home() {
             Once run, the embeddings will be saved to <span className="font-mono text-neutral-400">src/embeddings.json</span> and the app will refresh.
           </p>
         </div>
+        {uploadStatus && <div className="status-info" style={{ position: "fixed", bottom: 24 }}>{uploadStatus}</div>}
+        {isDraggingFile && (
+          <div className="drop-zone-overlay">
+            <div className="drop-zone-message">Drop images or videos to add them to this session</div>
+          </div>
+        )}
       </div>
     );
   }
 
   return (
-    <div className="grid-container">
+    <div
+      className="grid-container"
+      onDragOver={handleDragOver}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {isDraggingFile && (
+        <div className="drop-zone-overlay">
+          <div className="drop-zone-message">Drop images or videos to add them to this session</div>
+        </div>
+      )}
       {/* Floating control overlay */}
       <div className="controls-panel">
         <button
@@ -417,6 +631,25 @@ export default function Home() {
           </svg>
           Explore 3D
         </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*,video/*"
+          multiple
+          className="visually-hidden"
+          onChange={handleFileInputChange}
+        />
+        <button
+          className="control-btn"
+          onClick={() => fileInputRef.current?.click()}
+          title="Add your own images or videos to this session"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          Add
+        </button>
         <div className="divider"></div>
 
         {/* Content search: type words to find images by what they depict */}
@@ -450,19 +683,21 @@ export default function Home() {
           ?
         </button>
 
-        {/* Status display: search progress, or item count */}
+        {/* Status display: upload progress, search progress, or item count */}
         <span className="status-info">
-          {searchStatus
-            ? searchStatus
-            : textVec
-              ? `Results for “${searchTerm.trim()}”`
-              : `${items.length} items`}
+          {uploadStatus
+            ? uploadStatus
+            : searchStatus
+              ? searchStatus
+              : textVec
+                ? `Results for “${searchTerm.trim()}”`
+                : `${items.length} items`}
         </span>
 
         {/* Help popover */}
         <div ref={helpRef} className={`help-tooltip ${showHelp ? "visible" : ""}`}>
           <h3>River Exploration</h3>
-          <p>This is a lateral exploration tool for your local image library, connected via SigLIP ViT-B/16 (384px) embeddings.</p>
+          <p>This is a lateral exploration tool for your local image library, connected via SigLIP ViT-L/16 (384px) embeddings.</p>
           <ul>
             <li><span className="key-hint">Search</span> by content — type what you&apos;re looking for (e.g. &quot;buttons&quot;, &quot;a red flower&quot;) and press Enter to rank images by what they depict, not their filename.</li>
             <li><span className="key-hint">Left-Click</span> an image to refill the grid with its visually nearest neighbors.</li>
@@ -506,6 +741,9 @@ interface ImageCardProps {
 
 const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRightClick }) => {
   const [loaded, setLoaded] = useState(false);
+  const [videoPlaying, setVideoPlaying] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const isVideo = item.kind === "video";
 
   useEffect(() => {
     let active = true;
@@ -535,6 +773,22 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRight
     };
   }, [item.thumb]);
 
+  // Hover-to-play: click and right-click are already bound to existing
+  // interactions (hop-to-neighbor, open full-size), so hover is the only
+  // affordance left for video preview — muted/looped, matching the common
+  // silent-preview convention.
+  const handleMouseEnter = () => {
+    if (!isVideo || !videoRef.current) return;
+    videoRef.current.currentTime = 0;
+    videoRef.current.play().catch(() => {});
+    setVideoPlaying(true);
+  };
+  const handleMouseLeave = () => {
+    if (!isVideo || !videoRef.current) return;
+    videoRef.current.pause();
+    setVideoPlaying(false);
+  };
+
   return (
     <div
       className="image-item"
@@ -546,13 +800,37 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRight
       }}
       onClick={onClick}
       onContextMenu={onRightClick}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
-      <img
-        src={item.thumb}
-        alt=""
-        className={`image-element ${loaded ? "loaded" : ""}`}
-        draggable={false}
-      />
+      {isVideo ? (
+        <>
+          <video
+            ref={videoRef}
+            src={item.file}
+            poster={item.thumb}
+            className={`image-element ${loaded ? "loaded" : ""}`}
+            muted
+            loop
+            playsInline
+            preload="metadata"
+          />
+          {!videoPlaying && (
+            <div className="video-play-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="6 3 20 12 6 21 6 3"></polygon>
+              </svg>
+            </div>
+          )}
+        </>
+      ) : (
+        <img
+          src={item.thumb}
+          alt=""
+          className={`image-element ${loaded ? "loaded" : ""}`}
+          draggable={false}
+        />
+      )}
     </div>
   );
 });
