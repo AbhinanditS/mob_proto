@@ -83,7 +83,12 @@ export interface AnalysisResult {
 
 // Tunables
 export const POOL_SIZE = 26;
-export const MAX_COMPARISONS = 26;
+// With POOL_SIZE=26, the previous cap of 26 comparisons collected only ~1
+// comparison/item on average — too sparse for Bradley-Terry to meaningfully
+// separate strengths (propagateStrengths() exists precisely to smooth over
+// this sparsity). 60 (~2.3/item) densifies the comparison graph meaningfully
+// while staying a manageable click-budget for a forced-choice UI.
+export const MAX_COMPARISONS = 60;
 
 // TrueSkill parameters (standard defaults, on a 0..50 scale).
 const MU0 = 25;
@@ -96,6 +101,7 @@ const PAIR_EMB_WEIGHT = 0.5; // how strongly to prefer visually similar pairs
 const BT_PRIOR = 1.0;        // virtual win/loss vs a mean-strength phantom
 const BT_ITERS = 200;
 const BT_RIDGE = 0.25;       // Normal(0, 1/ridge) prior on log-strength → bounds SEs
+const BT_TOL = 1e-6;         // MM fixed-point convergence tolerance (max relative strength delta)
 const PROP_K0 = 2.5;         // appearances pseudo-count for the propagation blend
 const PROP_TEMP = 0.08;      // softmax temperature over cosine in propagation
 const K_CLUSTERS = 8;
@@ -400,7 +406,16 @@ export function fitBradleyTerry(
     let logSum = 0;
     for (let i = 0; i < n; i++) logSum += Math.log(next[i]);
     const geo = Math.exp(logSum / n);
-    for (let i = 0; i < n; i++) strength[i] = next[i] / geo;
+
+    let maxDelta = 0;
+    for (let i = 0; i < n; i++) {
+      const normalized = next[i] / geo;
+      const delta = Math.abs(normalized - strength[i]) / (strength[i] + 1e-9);
+      if (delta > maxDelta) maxDelta = delta;
+      strength[i] = normalized;
+    }
+
+    if (maxDelta < BT_TOL) break;
   }
 
   return strength;
