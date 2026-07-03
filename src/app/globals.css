@@ -44,9 +44,14 @@ body, html {
   padding-bottom: 40px; /* add some bottom spacing for aesthetics */
 }
 
-/* The visual image item wrapper */
+/* The visual image item wrapper. Position lives in the transform (--tx/--ty
+   set inline by the layout) so reorders glide on the compositor; --steer-scale
+   is the Steer pad's per-tile relevance bump (1 when idle). */
 .image-item {
   position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate3d(var(--tx, 0px), var(--ty, 0px), 0) scale(var(--steer-scale, 1));
   cursor: pointer;
   overflow: hidden;
   background-color: #121212;
@@ -71,7 +76,7 @@ body, html {
 
 /* Subtle border/outline and hover scaling */
 .image-item:hover {
-  transform: scale(1.02);
+  transform: translate3d(var(--tx, 0px), var(--ty, 0px), 0) scale(1.02);
   z-index: 10;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
   outline: 2px solid rgba(255, 255, 255, 0.8);
@@ -953,10 +958,11 @@ body, html {
   color: rgba(248, 113, 113, 0.75);
 }
 
-/* While steering, drop the transform transition (per-frame retargeting reads
-   rubbery) and let a short linear opacity transition smooth between frames. */
+/* While steering: opacity gets NO transition (dimming must track the puck
+   instantly) and the transform transition is stretched so mid-drag re-sorts
+   read as tiles gliding to their new spots rather than teleporting. */
 .grid-container.steering .image-item {
-  transition: opacity 0.18s linear, outline 0.15s ease;
+  transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), outline 0.15s ease;
 }
 
 /* ---- drag-and-drop upload ---------------------------------------------- */

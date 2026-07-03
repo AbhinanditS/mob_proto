@@ -28,6 +28,11 @@ interface LaidOutItem extends ImageRecord {
 
 const VIDEO_POSTER_SEEK_FRACTION = 0.1; // seek 10% into the clip — frame 0 is often black/blank
 
+// Minimum ms between mid-drag grid re-sorts while steering. The transform
+// transition (globals.css .steering) glides tiles between arrangements, so
+// this cadence reads as continuous without re-rendering the grid per frame.
+const STEER_REORDER_MS = 150;
+
 // Extract one representative frame from a video File via an offscreen
 // <video>+<canvas> — no ffmpeg, no server round-trip. The frame is embedded
 // exactly like an uploaded image; the original video stays playable in the
@@ -97,8 +102,11 @@ export default function Home() {
   // Steer: a floating 2D pad that synthesizes a query vector per animation
   // frame. Its relevance is painted onto the grid imperatively (never through
   // React state, so drags stay at 60fps) and forwarded to the 3D navigator
-  // through steerChannelRef when that overlay is open.
+  // through steerChannelRef when that overlay is open. steerRank re-sorts the
+  // grid to the steered ranking on a throttled cadence — tiles glide to their
+  // new spots via the transform transition.
   const [steerActive, setSteerActive] = useState(false);
+  const [steerRank, setSteerRank] = useState<string[] | null>(null);
 
   // Text content-search state
   const [searchTerm, setSearchTerm] = useState("");
@@ -116,6 +124,7 @@ export default function Home() {
   // Cache the lazily-loaded tokenizer + text model so only the first search
   // pays the load/download cost.
   const textModelRef = useRef<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel } | null>(null);
+  const textModelPromiseRef = useRef<Promise<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel }> | null>(null);
   // Same lazy-load-once pattern for embedding uploaded images/video frames.
   const visionModelRef = useRef<{ processor: Processor; model: PreTrainedModel } | null>(null);
   // Monotonic token to invalidate in-flight searches when the user clears the
@@ -133,6 +142,7 @@ export default function Home() {
   const gridElsRef = useRef(new Map<string, HTMLDivElement>());
   const steerChannelRef = useRef<SteerChannel | null>(null);
   const lastSteerRef = useRef<{ relevance: Float32Array; topIndex: number } | null>(null);
+  const lastReorderRef = useRef(0); // timestamp of the last mid-drag re-sort
 
   // Items: the precomputed dataset, plus anything dropped in this session.
   // Lazy initializer preserves the old useMemo's "compute once" semantics for
@@ -248,9 +258,27 @@ export default function Home() {
       .map(x => x.it);
   }, [queryId, textVec, items, byId]);
 
+  // Grid display order: the steered ranking while steering, else the
+  // neighborhood. Items missing from the rank (e.g. an upload that landed
+  // mid-drag) keep their neighborhood position at the end.
+  const displayItems = useMemo(() => {
+    if (!steerActive || !steerRank) return neighborhood;
+    const ranked: typeof neighborhood = [];
+    const seen = new Set<string>();
+    for (const id of steerRank) {
+      const it = byId.get(id);
+      if (it) {
+        ranked.push(it);
+        seen.add(id);
+      }
+    }
+    for (const it of neighborhood) if (!seen.has(it.id)) ranked.push(it);
+    return ranked;
+  }, [neighborhood, steerActive, steerRank, byId]);
+
   // Layout geometry computation (Justified Grid)
   const flatLaidOutItems = useMemo(() => {
-    if (neighborhood.length === 0) return [];
+    if (displayItems.length === 0) return [];
 
     const containerW = dimensions.w;
     const containerH = dimensions.h;
@@ -262,8 +290,8 @@ export default function Home() {
     let currentRow: ImageRecord[] = [];
     let currentRowWidth = 0;
 
-    for (let i = 0; i < neighborhood.length; i++) {
-      const item = neighborhood[i];
+    for (let i = 0; i < displayItems.length; i++) {
+      const item = displayItems[i];
       const aspect = item.w / item.h;
       const itemW = aspect * targetH;
       const additionalW = currentRow.length > 0 ? gap + itemW : itemW;
@@ -319,7 +347,7 @@ export default function Home() {
     }
 
     return laidOut;
-  }, [neighborhood, dimensions]);
+  }, [displayItems, dimensions]);
 
   // Left click (hop to neighbor). Clicking a result hands control back to
   // image-to-image visual exploration, exiting text-search mode.
@@ -338,19 +366,26 @@ export default function Home() {
   };
 
   // Lazy-load SigLIP's text tower once and cache it for every consumer (the
-  // search bar and the Steer pad share the same model instance).
-  const ensureTextModel = useCallback(async () => {
-    let cached = textModelRef.current;
-    if (!cached) {
-      const { AutoTokenizer, SiglipTextModel, env } = await import("@huggingface/transformers");
-      // Fetch from the HuggingFace CDN; skip spurious local-path lookups.
-      env.allowLocalModels = false;
-      const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
-      const model = await SiglipTextModel.from_pretrained(MODEL, { dtype: "q8" });
-      cached = { tokenizer, model };
-      textModelRef.current = cached;
+  // search bar and the Steer pad share the same model instance). The in-flight
+  // promise is memoized so concurrent callers (the pad embeds its pole words
+  // in parallel) share one load instead of racing four.
+  const ensureTextModel = useCallback(() => {
+    if (!textModelPromiseRef.current) {
+      textModelPromiseRef.current = (async () => {
+        const { AutoTokenizer, SiglipTextModel, env } = await import("@huggingface/transformers");
+        // Fetch from the HuggingFace CDN; skip spurious local-path lookups.
+        env.allowLocalModels = false;
+        const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
+        const model = await SiglipTextModel.from_pretrained(MODEL, { dtype: "q8" });
+        const cached = { tokenizer, model };
+        textModelRef.current = cached;
+        return cached;
+      })().catch(err => {
+        textModelPromiseRef.current = null; // failed loads may be retried
+        throw err;
+      });
     }
-    return cached;
+    return textModelPromiseRef.current;
   }, []);
 
   // Embed one string with the text tower. L2-normalized so dot product equals
@@ -421,8 +456,10 @@ export default function Home() {
 
   // Paint relevance onto the grid: opacity + a small scale bump per tile, a
   // ring on the top match. Compositor-only properties, no layout reads, no
-  // React — this runs once per animation frame during a drag. The grid's
-  // ORDER is deliberately untouched; the pad is a lens, not a sort.
+  // React — this runs once per animation frame during a drag, and there are
+  // deliberately NO transitions on opacity so the response is instant. The
+  // scale bump goes through the --steer-scale custom property because the
+  // transform itself belongs to the stylesheet (it carries tile position).
   const applySteerToGrid = useCallback((relevance: Float32Array, topIndex: number) => {
     const els = gridElsRef.current;
     const m = Math.min(items.length, relevance.length); // guard mid-upload length skew
@@ -431,7 +468,7 @@ export default function Home() {
       if (!el) continue;
       const r = relevance[i];
       el.style.opacity = String(OPACITY_FLOOR + (1 - OPACITY_FLOOR) * r);
-      el.style.transform = `scale(${(1 + 0.035 * r * r).toFixed(4)})`;
+      el.style.setProperty("--steer-scale", (1 + 0.035 * r * r).toFixed(4));
       if (i === topIndex) {
         el.style.outline = "2px solid rgba(125, 211, 252, 0.85)";
         el.style.zIndex = "5";
@@ -442,18 +479,42 @@ export default function Home() {
     }
   }, [items]);
 
+  // The steered ranking as item ids, most relevant first. Relevance is a
+  // monotonic transform of the scores, so sorting by it preserves the true
+  // cosine order.
+  const rankFromRelevance = useCallback((relevance: Float32Array) => {
+    const m = Math.min(items.length, relevance.length);
+    const idx = Array.from({ length: m }, (_, i) => i);
+    idx.sort((a, b) => relevance[b] - relevance[a]);
+    return idx.map(i => items[i].id);
+  }, [items]);
+
   const handleSteer = useCallback(
     (relevance: Float32Array, topIndex: number) => {
       lastSteerRef.current = { relevance, topIndex };
       applySteerToGrid(relevance, topIndex);
       steerChannelRef.current?.applySteer(relevance, topIndex);
+      // Mid-drag re-sort, throttled: React relayouts every STEER_REORDER_MS
+      // while the transform transition glides tiles between arrangements.
+      // Pointless while the 3D overlay hides the grid.
+      if (!navigatorActive) {
+        const now = performance.now();
+        if (now - lastReorderRef.current >= STEER_REORDER_MS) {
+          lastReorderRef.current = now;
+          setSteerRank(rankFromRelevance(relevance));
+        }
+      }
     },
-    [applySteerToGrid]
+    [applySteerToGrid, rankFromRelevance, navigatorActive]
   );
 
   const handleSteerEnd = useCallback(() => {
+    // One exact, unthrottled sort at the release position.
+    if (lastSteerRef.current && !navigatorActive) {
+      setSteerRank(rankFromRelevance(lastSteerRef.current.relevance));
+    }
     steerChannelRef.current?.steerEnd();
-  }, []);
+  }, [rankFromRelevance, navigatorActive]);
 
   // Re-renders (resize reflow, uploads) mount fresh tiles without steer
   // styles — repaint them from the last emitted relevance.
@@ -463,16 +524,18 @@ export default function Home() {
   }, [steerActive, flatLaidOutItems, applySteerToGrid]);
 
   // Steer off: remove every inline steer style so the stylesheet (including
-  // :hover scale/outline) takes back over exactly, and reset the 3D view.
+  // :hover scale/outline) takes back over exactly, drop the steered order,
+  // and reset the 3D view.
   useEffect(() => {
     if (steerActive) return;
     for (const el of gridElsRef.current.values()) {
       el.style.removeProperty("opacity");
-      el.style.removeProperty("transform");
+      el.style.removeProperty("--steer-scale");
       el.style.removeProperty("outline");
       el.style.removeProperty("z-index");
     }
     lastSteerRef.current = null;
+    setSteerRank(null);
     steerChannelRef.current?.clearSteer();
   }, [steerActive]);
 
@@ -922,12 +985,15 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRight
     <div
       ref={(el) => registerEl?.(item.id, el)}
       className="image-item"
+      // Position rides the transform (via --tx/--ty, composed in the
+      // stylesheet) rather than left/top, so reorders animate on the
+      // compositor with zero layout work.
       style={{
-        left: `${item.left}px`,
-        top: `${item.top}px`,
+        "--tx": `${item.left}px`,
+        "--ty": `${item.top}px`,
         width: `${item.width}px`,
         height: `${item.height}px`,
-      }}
+      } as React.CSSProperties}
       onClick={onClick}
       onContextMenu={onRightClick}
       onMouseEnter={handleMouseEnter}

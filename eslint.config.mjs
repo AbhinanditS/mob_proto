@@ -10,6 +10,11 @@ const compat = new FlatCompat({
 });
 
 const eslintConfig = [
+  {
+    // Build artifacts — linting .next output floods the report the first
+    // time `npm run lint` runs after a build.
+    ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts"],
+  },
   ...compat.extends("next/core-web-vitals"),
   ...compat.extends("next/typescript"),
   {

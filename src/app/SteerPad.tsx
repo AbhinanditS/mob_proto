@@ -159,22 +159,22 @@ export default function SteerPad({ ctx, embedText, onSteer, onSteerEnd }: SteerP
         bottom: p.bottom.trim(),
         top: p.top.trim(),
       };
+      // Embed all missing words in parallel — the model load is deduped
+      // upstream (ensureTextModel memoizes its promise) and ONNX serializes
+      // the runs internally, so this only removes await-chain latency.
+      const missing = [...new Set(Object.values(words).filter(w => w && !wordVecCacheRef.current.has(w)))];
+      await Promise.all(
+        missing.map(async (w) => {
+          const v = await embedTextRef.current(w);
+          wordVecCacheRef.current.set(w, v);
+        })
+      );
+      if (deriveSeqRef.current !== seq) return;
       const vecs = {} as Record<PoleSide, Float32Array | null>;
       for (const side of ["left", "right", "bottom", "top"] as PoleSide[]) {
-        const w = words[side];
-        if (!w) {
-          vecs[side] = null; // empty pole → that axis disabled, 1-axis steering
-          continue;
-        }
-        let v = wordVecCacheRef.current.get(w);
-        if (!v) {
-          v = await embedTextRef.current(w);
-          if (deriveSeqRef.current !== seq) return;
-          wordVecCacheRef.current.set(w, v);
-        }
-        vecs[side] = v;
+        // Empty pole → that axis disabled, 1-axis steering.
+        vecs[side] = words[side] ? wordVecCacheRef.current.get(words[side])! : null;
       }
-      if (deriveSeqRef.current !== seq) return;
 
       let degenerate: "x" | "y" | null = null;
       let ax: Float32Array | null = null;
