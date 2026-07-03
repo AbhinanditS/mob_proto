@@ -54,6 +54,15 @@ const DENSITY_K = 6;
 const WARP_RADIUS = LAYOUT_RADIUS * 0.25;
 const WARP_RELEASE_MS = 450;
 
+// Steer tunables (the pad drives the scene through SteerChannel).
+// SCALE_LO/HI are interpolated into the vertex shader source below AND reused
+// by pickAt's CPU-side hit-test compensation — single source of truth.
+const STEER_SCALE_LO = 0.7; // size factor at relevance 0
+const STEER_SCALE_HI = 1.12; // size factor at relevance 1
+const STEER_GLYPH_RADIUS = LAYOUT_RADIUS * 0.016; // kin to the probe marker, slightly larger
+const STEER_GLYPH_LERP = 0.25; // per-frame glide toward the current top match
+const STEER_EASE_MS = 450; // drag-end orbit-target pan duration
+
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
@@ -104,6 +113,7 @@ const VERT = /* glsl */ `
   attribute float iIndex;
   attribute float iPromote;
   attribute float iDensity;
+  attribute float iRelevance;
 
   uniform float uBaseSize;
   uniform float uDistGain;
@@ -111,12 +121,14 @@ const VERT = /* glsl */ `
   uniform float uFocusedIndex;
   uniform float uProbeActive;
   uniform float uProbeBaseScale;
+  uniform float uSteerActive;
 
   varying vec2 vUv;
   varying vec2 vQuadUv;
   varying float vState;
   varying float vDepth;
   varying float vDensity;
+  varying float vRelevance;
 
   void main() {
     vQuadUv = uv;
@@ -125,6 +137,7 @@ const VERT = /* glsl */ `
                iAtlasUV.y + (1.0 - uv.y) * iAtlasUV.w);
     vState = iState;
     vDensity = iDensity;
+    vRelevance = iRelevance;
 
     vec4 mv = modelViewMatrix * vec4(iOffset, 1.0);
     float depth = -mv.z;
@@ -137,7 +150,10 @@ const VERT = /* glsl */ `
     // so explore mode's output stays pixel-identical to before.
     float probeShrink = mix(1.0, uProbeBaseScale, uProbeActive);
     float densityScale = mix(1.0, mix(0.45, 1.0, iDensity), uProbeActive);
-    float h = uBaseSize * gain * emph * probeShrink * densityScale;
+    // Steer mode: relevant points grow slightly, the rest recede. A no-op when
+    // uSteerActive=0, so explore/probe output stays pixel-identical to before.
+    float steerScale = mix(1.0, mix(${STEER_SCALE_LO.toFixed(2)}, ${STEER_SCALE_HI.toFixed(2)}, iRelevance), uSteerActive);
+    float h = uBaseSize * gain * emph * probeShrink * densityScale * steerScale;
     float w = h * iAspect;
 
     // Collapse the focused instance (explore mode) OR a promoted hi-res-pool
@@ -158,12 +174,14 @@ const FRAG = /* glsl */ `
   uniform float uFogDensity;
   uniform vec3 uRingColor;
   uniform float uProbeActive;
+  uniform float uSteerActive;
 
   varying vec2 vUv;
   varying vec2 vQuadUv;
   varying float vState;
   varying float vDepth;
   varying float vDensity;
+  varying float vRelevance;
 
   void main() {
     vec4 tex = texture2D(uAtlas, vUv);
@@ -186,6 +204,15 @@ const FRAG = /* glsl */ `
       float sat = mix(0.35, 1.0, vDensity);
       color = mix(vec3(gray), color, sat);
       alpha *= mix(0.55, 1.0, vDensity);
+    }
+
+    // Steer mode: fade + desaturate low-relevance points; the top of the
+    // relevance ramp keeps full color and alpha, so matches visibly brighten
+    // against the receding field.
+    if (uSteerActive > 0.5) {
+      float gray = dot(color, vec3(0.299, 0.587, 0.114));
+      color = mix(vec3(gray), color, mix(0.3, 1.0, vRelevance));
+      alpha *= mix(0.18, 1.0, vRelevance);
     }
 
     // Exponential-squared depth fog toward the near-black background.
@@ -263,6 +290,14 @@ class NavigatorScene {
   private orbiting = false;
   private scheduleProbeQuery!: (() => void) & { cancel: () => void };
 
+  // ---- steer mode (driven externally by the Steer pad via SteerChannel) ------
+  private steerActive = false; // steer data present (the pad is driving us)
+  private steerTopIndex = -1;
+  private steerMarker: THREE.Mesh | null = null;
+  private steerGlyphTarget = new THREE.Vector3();
+  private relevanceArr!: Float32Array; // per-instance steer relevance [0,1]
+  private iRelevanceAttr!: THREE.InstancedBufferAttribute;
+
   // ---- drag-to-pull warp ------------------------------------------------------
   private warpActive = false;
   private warpAnchorIndex = -1;
@@ -338,7 +373,8 @@ class NavigatorScene {
     this.controls.addEventListener("end", this.onControlsEnd);
 
     this.buildMesh(atlas);
-    this.buildProbeMarker();
+    this.probeMarker = this.buildMarker(LAYOUT_RADIUS * 0.012);
+    this.steerMarker = this.buildMarker(STEER_GLYPH_RADIUS);
 
     this.canvas.addEventListener("pointermove", this.onPointerMove);
     this.canvas.addEventListener("pointerdown", this.onPointerDown);
@@ -355,6 +391,10 @@ class NavigatorScene {
           this.updateProbePoint(this.lastClientX, this.lastClientY);
         }
         this.syncPoolPositions();
+      }
+      if (this.steerMarker?.visible) {
+        // Glide toward the current top match instead of teleporting per frame.
+        this.steerMarker.position.lerp(this.steerGlyphTarget, STEER_GLYPH_LERP);
       }
       if (this.warpReleaseTween?.active) this.stepWarpRelease(now);
       this.renderer.render(this.scene, this.camera);
@@ -446,6 +486,7 @@ class NavigatorScene {
     this.stateArr = new Float32Array(n);
     this.promoteArr = new Float32Array(n);
     this.densityArr = new Float32Array(n).fill(1); // neutral until computeDensity runs
+    this.relevanceArr = new Float32Array(n).fill(1); // neutral until the pad steers
 
     const indices = new Float32Array(n);
     for (let i = 0; i < n; i++) indices[i] = i;
@@ -471,6 +512,9 @@ class NavigatorScene {
     this.iDensityAttr = new THREE.InstancedBufferAttribute(this.densityArr, 1);
     this.iDensityAttr.setUsage(THREE.DynamicDrawUsage);
     geo.setAttribute("iDensity", this.iDensityAttr);
+    this.iRelevanceAttr = new THREE.InstancedBufferAttribute(this.relevanceArr, 1);
+    this.iRelevanceAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("iRelevance", this.iRelevanceAttr);
     base.dispose();
 
     this.material = new THREE.ShaderMaterial({
@@ -485,6 +529,7 @@ class NavigatorScene {
         uRingColor: { value: new THREE.Vector3(1, 1, 1) },
         uProbeActive: { value: 0 },
         uProbeBaseScale: { value: PROBE_BASE_SCALE },
+        uSteerActive: { value: 0 },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
@@ -499,18 +544,21 @@ class NavigatorScene {
     this.scene.add(this.mesh);
   }
 
-  private buildProbeMarker() {
-    const geo = new THREE.SphereGeometry(LAYOUT_RADIUS * 0.012, 12, 12);
+  // Shared sky-dot marker builder — the probe point and the steer glyph are
+  // visibly kin, differing only in size.
+  private buildMarker(radius: number): THREE.Mesh {
+    const geo = new THREE.SphereGeometry(radius, 12, 12);
     const mat = new THREE.MeshBasicMaterial({
       color: 0x7dd3fc,
       transparent: true,
       opacity: 0.85,
       depthTest: false,
     });
-    this.probeMarker = new THREE.Mesh(geo, mat);
-    this.probeMarker.renderOrder = 12;
-    this.probeMarker.visible = false;
-    this.scene.add(this.probeMarker);
+    const marker = new THREE.Mesh(geo, mat);
+    marker.renderOrder = 12;
+    marker.visible = false;
+    this.scene.add(marker);
+    return marker;
   }
 
   // ---- render loop helpers -------------------------------------------------
@@ -550,13 +598,13 @@ class NavigatorScene {
 
   // ---- camera framing ------------------------------------------------------
 
-  private frameCameraTo(toPos: THREE.Vector3, toTarget: THREE.Vector3) {
+  private frameCameraTo(toPos: THREE.Vector3, toTarget: THREE.Vector3, durationMs = TWEEN_MS) {
     this.tween.fromPos.copy(this.camera.position);
     this.tween.toPos.copy(toPos);
     this.tween.fromTarget.copy(this.controls.target);
     this.tween.toTarget.copy(toTarget);
     this.tween.start = performance.now();
-    this.tween.dur = TWEEN_MS;
+    this.tween.dur = durationMs;
     this.tween.active = true;
     this.controls.enabled = false;
     this.controls.autoRotate = false;
@@ -814,7 +862,18 @@ class NavigatorScene {
       this.ensureDensity();
       this.controls.autoRotate = false;
       if (this.probeMarker) this.probeMarker.visible = true;
+      // Probe owns the cloud's dimming while active — suspend steer visuals
+      // (the relevance data stays intact and resumes when probe exits).
+      if (this.material) this.material.uniforms.uSteerActive.value = 0;
+      if (this.steerMarker) this.steerMarker.visible = false;
     } else {
+      if (this.steerActive && this.material) {
+        this.material.uniforms.uSteerActive.value = 1;
+        if (this.steerMarker && this.steerTopIndex >= 0) {
+          this.steerMarker.position.copy(this.steerGlyphTarget);
+          this.steerMarker.visible = true;
+        }
+      }
       this.scheduleProbeQuery.cancel();
       this.lastProbeIndices = [];
       this.clearPromotions();
@@ -829,6 +888,67 @@ class NavigatorScene {
       if (this.iOffsetAttr) this.iOffsetAttr.needsUpdate = true;
       if (this.focusedIndex < 0) this.scheduleIdle();
     }
+  }
+
+  // ---- steer mode (public — called through SteerChannel) --------------------
+
+  // Per-frame while the pad is dragged: copy the relevance field into the
+  // instanced attribute and snap the glyph target to the top match's frozen
+  // LAYOUT position. Guards matter: build() is async (the channel can call in
+  // before the mesh exists), and `items` can grow mid-steer via uploads while
+  // this once-built scene still holds the old count — mismatched frames are
+  // dropped rather than misapplied.
+  applySteer(relevance: Float32Array, topIndex: number) {
+    if (!this.material || relevance.length !== this.n) return;
+    this.steerActive = true;
+    this.relevanceArr.set(relevance);
+    this.iRelevanceAttr.needsUpdate = true;
+    this.steerTopIndex = topIndex;
+    if (topIndex >= 0) {
+      this.steerGlyphTarget.set(
+        this.positions[topIndex * 3],
+        this.positions[topIndex * 3 + 1],
+        this.positions[topIndex * 3 + 2]
+      );
+    }
+    this.controls.autoRotate = false;
+    this.clearIdle();
+    if (!this.probeActive) {
+      this.material.uniforms.uSteerActive.value = 1;
+      if (this.steerMarker) {
+        if (!this.steerMarker.visible && topIndex >= 0) {
+          // First frame of a steer session: appear in place, don't glide in
+          // from wherever the marker was left last time.
+          this.steerMarker.position.copy(this.steerGlyphTarget);
+        }
+        this.steerMarker.visible = true;
+      }
+    }
+  }
+
+  // Pad drag released: gently pan toward the top match. Camera and orbit
+  // target translate by the same delta, preserving distance and view
+  // direction — a reframe, not a dive.
+  steerEnd() {
+    if (!this.steerActive || this.probeActive) return;
+    if (this.steerTopIndex < 0 || this.tween.active || this.focusedIndex >= 0) return;
+    if (this.controls.target.distanceTo(this.steerGlyphTarget) < LAYOUT_RADIUS * 0.05) return;
+    const toTarget = this.steerGlyphTarget.clone();
+    const toPos = this.camera.position.clone().add(toTarget).sub(this.controls.target);
+    this.frameCameraTo(toPos, toTarget, STEER_EASE_MS);
+  }
+
+  // Steer mode ended (pad closed): restore the neutral cloud.
+  clearSteer() {
+    this.steerActive = false;
+    this.steerTopIndex = -1;
+    if (this.material) {
+      this.relevanceArr.fill(1);
+      this.iRelevanceAttr.needsUpdate = true;
+      this.material.uniforms.uSteerActive.value = 0;
+    }
+    if (this.steerMarker) this.steerMarker.visible = false;
+    if (this.focusedIndex < 0 && !this.probeActive) this.scheduleIdle();
   }
 
   // ---- probe mode: drag-to-pull warp ----------------------------------------
@@ -915,7 +1035,13 @@ class NavigatorScene {
   private scheduleIdle() {
     this.clearIdle();
     this.idleTimer = window.setTimeout(() => {
-      if (!this.disposed && this.focusedIndex < 0 && !this.probeActive && !this.tween.active) {
+      if (
+        !this.disposed &&
+        this.focusedIndex < 0 &&
+        !this.probeActive &&
+        !this.steerActive &&
+        !this.tween.active
+      ) {
         this.controls.autoRotate = true;
       }
     }, IDLE_MS);
@@ -1014,6 +1140,10 @@ class NavigatorScene {
       const gain = 1 + DIST_GAIN * Math.min(2, dist / OVERVIEW_DIST);
       let halfH = ((BASE_SIZE * gain) / 2 / dist) * projScale;
       if (this.probeActive) halfH *= PROBE_BASE_SCALE; // match the shrunk at-rest size
+      else if (this.steerActive) {
+        // Match the steer size ramp in the vertex shader.
+        halfH *= STEER_SCALE_LO + (STEER_SCALE_HI - STEER_SCALE_LO) * this.relevanceArr[i];
+      }
       const halfW = halfH * this.aspects[i];
       if (Math.abs(px - sx) <= halfW && Math.abs(py - sy) <= halfH) {
         if (dist < bestDist) {
@@ -1109,6 +1239,11 @@ class NavigatorScene {
       this.probeMarker.geometry.dispose();
       (this.probeMarker.material as THREE.Material).dispose();
     }
+    if (this.steerMarker) {
+      this.scene.remove(this.steerMarker);
+      this.steerMarker.geometry.dispose();
+      (this.steerMarker.material as THREE.Material).dispose();
+    }
     for (const slot of this.hiResPool) this.disposeHiResSlot(slot);
     this.hiResPool = [];
     this.geometry?.dispose();
@@ -1123,12 +1258,24 @@ class NavigatorScene {
 // ---------------------------------------------------------------------------
 // React shell
 // ---------------------------------------------------------------------------
+
+// Imperative bridge for the Steer pad: page.tsx owns a ref that this overlay
+// populates while mounted, so pad frames reach the scene without any React
+// state on the 60fps path. All methods are safe to call before build()
+// finishes — the scene guards internally.
+export interface SteerChannel {
+  applySteer(relevance: Float32Array, topIndex: number): void;
+  steerEnd(): void;
+  clearSteer(): void;
+}
+
 interface Navigator3DProps {
   items: ConvergeImage[];
   onExit: () => void;
+  steerChannel?: React.RefObject<SteerChannel | null>;
 }
 
-export default function Navigator3D({ items, onExit }: Navigator3DProps) {
+export default function Navigator3D({ items, onExit, steerChannel }: Navigator3DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sceneRef = useRef<NavigatorScene | null>(null);
 
@@ -1224,6 +1371,13 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
       },
     });
     sceneRef.current = scene;
+    if (steerChannel) {
+      steerChannel.current = {
+        applySteer: (relevance, topIndex) => sceneRef.current?.applySteer(relevance, topIndex),
+        steerEnd: () => sceneRef.current?.steerEnd(),
+        clearSteer: () => sceneRef.current?.clearSteer(),
+      };
+    }
     let cancelled = false;
     scene.build().then(() => {
       if (!cancelled) setLoading(false);
@@ -1233,6 +1387,7 @@ export default function Navigator3D({ items, onExit }: Navigator3DProps) {
     return () => {
       cancelled = true;
       window.removeEventListener("resize", onResize);
+      if (steerChannel) steerChannel.current = null;
       scene.dispose();
       sceneRef.current = null;
     };

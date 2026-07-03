@@ -794,6 +794,171 @@ body, html {
   pointer-events: none;
 }
 
+/* ===========================================================================
+   Steer pad — 2D semantic-axis controller
+   =========================================================================== */
+
+.control-btn.active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.steer-pad {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  /* Above the Converge/Navigator overlays (200): the same pad steers
+     whichever view is visible. */
+  z-index: 300;
+  width: 240px;
+  background: rgba(10, 10, 10, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.steer-pad.disabled {
+  opacity: 0.5;
+}
+
+.steer-pad.disabled .steer-pad-surface {
+  pointer-events: none;
+}
+
+.steer-pad-surface {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1.4px);
+  background-size: 22px 22px;
+  background-position: center;
+  cursor: crosshair;
+  touch-action: none; /* the pad owns its drag gesture */
+}
+
+/* Faint center hairlines, stopped short of the edges where the pole labels sit. */
+.steer-pad-surface::before,
+.steer-pad-surface::after {
+  content: "";
+  position: absolute;
+  background: rgba(255, 255, 255, 0.05);
+  pointer-events: none;
+}
+
+.steer-pad-surface::before {
+  left: 15%;
+  right: 15%;
+  top: 50%;
+  height: 1px;
+}
+
+.steer-pad-surface::after {
+  top: 15%;
+  bottom: 15%;
+  left: 50%;
+  width: 1px;
+}
+
+.steer-puck {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: #7dd3fc;
+  box-shadow: 0 0 10px rgba(125, 211, 252, 0.45);
+  pointer-events: none;
+  will-change: transform;
+  z-index: 2;
+}
+
+.steer-pole {
+  position: absolute;
+  z-index: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-family: monospace;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.45);
+  text-align: center;
+  padding: 2px 4px;
+  transition: color 0.15s ease;
+}
+
+.steer-pole:hover {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.steer-pole:focus {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.steer-pole.top {
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.steer-pole.bottom {
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.steer-pole.left {
+  left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  text-align: left;
+}
+
+.steer-pole.right {
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  text-align: right;
+}
+
+.steer-readout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 0 2px;
+  font-family: monospace;
+  font-size: 0.68rem;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.steer-readout span:last-child {
+  flex-shrink: 0;
+}
+
+.steer-status {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.steer-status.error {
+  color: rgba(248, 113, 113, 0.75);
+}
+
+/* While steering, drop the transform transition (per-frame retargeting reads
+   rubbery) and let a short linear opacity transition smooth between frames. */
+.grid-container.steering .image-item {
+  transition: opacity 0.18s linear, outline 0.15s ease;
+}
+
 /* ---- drag-and-drop upload ---------------------------------------------- */
 
 /* Full-viewport overlay shown while a file is being dragged over the window.
