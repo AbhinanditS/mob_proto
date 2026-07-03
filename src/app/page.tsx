@@ -1,11 +1,13 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from "react";
 import type { PreTrainedTokenizer, PreTrainedModel, Processor, RawImage } from "@huggingface/transformers";
 import rawEmbeddings from "@/embeddings.json";
 import { MODEL } from "@/model";
 import Converge from "./Converge";
-import Navigator3D from "./Navigator3D";
+import Navigator3D, { type SteerChannel } from "./Navigator3D";
+import SteerPad from "./SteerPad";
+import { buildSteerContext, OPACITY_FLOOR } from "./steer";
 
 interface ImageRecord {
   id: string;
@@ -92,6 +94,11 @@ export default function Home() {
   // 3D navigator: a self-contained WebGL overlay over the same embeddings. Like
   // Converge, it never touches the main grid's queryId/textVec/neighborhood.
   const [navigatorActive, setNavigatorActive] = useState(false);
+  // Steer: a floating 2D pad that synthesizes a query vector per animation
+  // frame. Its relevance is painted onto the grid imperatively (never through
+  // React state, so drags stay at 60fps) and forwarded to the 3D navigator
+  // through steerChannelRef when that overlay is open.
+  const [steerActive, setSteerActive] = useState(false);
 
   // Text content-search state
   const [searchTerm, setSearchTerm] = useState("");
@@ -120,6 +127,12 @@ export default function Home() {
   // Counts nested dragenter/dragleave (fired on every child element under the
   // cursor) so the drop-zone overlay only toggles on the outermost enter/leave.
   const dragCounterRef = useRef(0);
+  // Steer plumbing: live grid tiles by id (for imperative styling), the 3D
+  // navigator's steer methods (populated while the overlay is mounted), and
+  // the last emitted relevance (reapplied after React re-renders the grid).
+  const gridElsRef = useRef(new Map<string, HTMLDivElement>());
+  const steerChannelRef = useRef<SteerChannel | null>(null);
+  const lastSteerRef = useRef<{ relevance: Float32Array; topIndex: number } | null>(null);
 
   // Items: the precomputed dataset, plus anything dropped in this session.
   // Lazy initializer preserves the old useMemo's "compute once" semantics for
@@ -135,6 +148,13 @@ export default function Home() {
   const byId = useMemo(() => {
     return new Map(items.map(item => [item.id, item]));
   }, [items]);
+
+  // Packed matrix + centroid for the Steer pad. Keyed on the items array
+  // identity, so uploads (which replace the array) invalidate it automatically.
+  const steerCtx = useMemo(
+    () => (steerActive && items.length > 0 ? buildSteerContext(items) : null),
+    [steerActive, items]
+  );
 
   // Set mounted and dimensions client-side, initialize seed query
   useEffect(() => {
@@ -317,6 +337,35 @@ export default function Home() {
     }
   };
 
+  // Lazy-load SigLIP's text tower once and cache it for every consumer (the
+  // search bar and the Steer pad share the same model instance).
+  const ensureTextModel = useCallback(async () => {
+    let cached = textModelRef.current;
+    if (!cached) {
+      const { AutoTokenizer, SiglipTextModel, env } = await import("@huggingface/transformers");
+      // Fetch from the HuggingFace CDN; skip spurious local-path lookups.
+      env.allowLocalModels = false;
+      const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
+      const model = await SiglipTextModel.from_pretrained(MODEL, { dtype: "q8" });
+      cached = { tokenizer, model };
+      textModelRef.current = cached;
+    }
+    return cached;
+  }, []);
+
+  // Embed one string with the text tower. L2-normalized so dot product equals
+  // cosine similarity, matching how the image vectors are normalized in
+  // scripts/precompute.ts.
+  const embedText = useCallback(async (text: string): Promise<Float32Array> => {
+    const { tokenizer, model } = await ensureTextModel();
+    // SigLIP expects fixed-length, padded (max_length 64) token sequences.
+    const inputs = tokenizer(text, { padding: "max_length", truncation: true });
+    const { pooler_output } = await model(inputs);
+    const v = Array.from(pooler_output.data as Float32Array);
+    const norm = Math.hypot(...v) || 1;
+    return new Float32Array(v.map(x => x / norm));
+  }, [ensureTextModel]);
+
   // Embed a typed query with SigLIP's text tower (client-side, lazy) and use
   // it to drive the ranking. The image vectors already live in this same space.
   const runTextSearch = async (text: string) => {
@@ -331,30 +380,13 @@ export default function Home() {
     }
 
     try {
-      let cached = textModelRef.current;
-      if (!cached) {
-        setSearchStatus("Loading model…");
-        const { AutoTokenizer, SiglipTextModel, env } = await import("@huggingface/transformers");
-        // Fetch from the HuggingFace CDN; skip spurious local-path lookups.
-        env.allowLocalModels = false;
-        const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
-        const model = await SiglipTextModel.from_pretrained(MODEL, { dtype: "q8" });
-        cached = { tokenizer, model };
-        textModelRef.current = cached;
-      }
+      if (!textModelRef.current) setSearchStatus("Loading model…");
+      await ensureTextModel();
       if (searchSeqRef.current !== seq) return;
 
       setSearchStatus("Searching…");
-      // SigLIP expects fixed-length, padded (max_length 64) token sequences.
-      const inputs = cached.tokenizer(query, { padding: "max_length", truncation: true });
-      const { pooler_output } = await cached.model(inputs);
+      const vec = await embedText(query);
       if (searchSeqRef.current !== seq) return;
-
-      const v = Array.from(pooler_output.data as Float32Array);
-      // L2-normalize so dot product equals cosine similarity, matching how the
-      // image vectors are normalized in scripts/precompute.ts.
-      const norm = Math.hypot(...v) || 1;
-      const vec = new Float32Array(v.map(x => x / norm));
 
       setTextVec(vec);
       setSearchStatus(null);
@@ -377,6 +409,72 @@ export default function Home() {
     setTextVec(null);
     setSearchStatus(null);
   };
+
+  // ---- Steer mode -----------------------------------------------------------
+
+  // ImageCards register their root elements here so steering can restyle them
+  // without React. Stable identity — doesn't defeat ImageCard's React.memo.
+  const registerGridEl = useCallback((id: string, el: HTMLDivElement | null) => {
+    if (el) gridElsRef.current.set(id, el);
+    else gridElsRef.current.delete(id);
+  }, []);
+
+  // Paint relevance onto the grid: opacity + a small scale bump per tile, a
+  // ring on the top match. Compositor-only properties, no layout reads, no
+  // React — this runs once per animation frame during a drag. The grid's
+  // ORDER is deliberately untouched; the pad is a lens, not a sort.
+  const applySteerToGrid = useCallback((relevance: Float32Array, topIndex: number) => {
+    const els = gridElsRef.current;
+    const m = Math.min(items.length, relevance.length); // guard mid-upload length skew
+    for (let i = 0; i < m; i++) {
+      const el = els.get(items[i].id);
+      if (!el) continue;
+      const r = relevance[i];
+      el.style.opacity = String(OPACITY_FLOOR + (1 - OPACITY_FLOOR) * r);
+      el.style.transform = `scale(${(1 + 0.035 * r * r).toFixed(4)})`;
+      if (i === topIndex) {
+        el.style.outline = "2px solid rgba(125, 211, 252, 0.85)";
+        el.style.zIndex = "5";
+      } else if (el.style.outline) {
+        el.style.outline = "";
+        el.style.zIndex = "";
+      }
+    }
+  }, [items]);
+
+  const handleSteer = useCallback(
+    (relevance: Float32Array, topIndex: number) => {
+      lastSteerRef.current = { relevance, topIndex };
+      applySteerToGrid(relevance, topIndex);
+      steerChannelRef.current?.applySteer(relevance, topIndex);
+    },
+    [applySteerToGrid]
+  );
+
+  const handleSteerEnd = useCallback(() => {
+    steerChannelRef.current?.steerEnd();
+  }, []);
+
+  // Re-renders (resize reflow, uploads) mount fresh tiles without steer
+  // styles — repaint them from the last emitted relevance.
+  useLayoutEffect(() => {
+    if (!steerActive || !lastSteerRef.current) return;
+    applySteerToGrid(lastSteerRef.current.relevance, lastSteerRef.current.topIndex);
+  }, [steerActive, flatLaidOutItems, applySteerToGrid]);
+
+  // Steer off: remove every inline steer style so the stylesheet (including
+  // :hover scale/outline) takes back over exactly, and reset the 3D view.
+  useEffect(() => {
+    if (steerActive) return;
+    for (const el of gridElsRef.current.values()) {
+      el.style.removeProperty("opacity");
+      el.style.removeProperty("transform");
+      el.style.removeProperty("outline");
+      el.style.removeProperty("z-index");
+    }
+    lastSteerRef.current = null;
+    steerChannelRef.current?.clearSteer();
+  }, [steerActive]);
 
   // Embed one already-loaded RawImage with SigLIP's vision tower (client-side,
   // lazy — mirrors runTextSearch's load-once-and-cache pattern above).
@@ -572,7 +670,7 @@ export default function Home() {
 
   return (
     <div
-      className="grid-container"
+      className={`grid-container${steerActive ? " steering" : ""}`}
       onDragOver={handleDragOver}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
@@ -630,6 +728,17 @@ export default function Home() {
             <path d="M21 7l-9 5-9-5"></path>
           </svg>
           Explore 3D
+        </button>
+        <button
+          className={`control-btn${steerActive ? " active" : ""}`}
+          onClick={() => setSteerActive(prev => !prev)}
+          title="Steer: drag a 2D pad between word poles to glide the ranking"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="4"></rect>
+            <circle cx="14" cy="10" r="2" fill="currentColor" stroke="none"></circle>
+          </svg>
+          Steer
         </button>
         <input
           ref={fileInputRef}
@@ -703,6 +812,7 @@ export default function Home() {
             <li><span className="key-hint">Left-Click</span> an image to refill the grid with its visually nearest neighbors.</li>
             <li><span className="key-hint">Right-Click</span> an image to open the high-res original in a new tab.</li>
             <li><span className="key-hint">Converge</span> mode — forced pairwise choices rank a diverse set by Bradley-Terry strength, then reveal which region you converged toward (←/→ or swipe; Esc to exit).</li>
+            <li><span className="key-hint">Steer</span> mode — drag a puck across a 2D pad whose axes run between typed word poles; the grid and 3D cloud continuously re-rank toward wherever you steer.</li>
             <li>Use the control buttons above to navigate your journey.</li>
           </ul>
           <p className="text-neutral-500 text-xs">The text model downloads once on your first search, then is cached for instant searches.</p>
@@ -717,6 +827,7 @@ export default function Home() {
           item={item}
           onClick={() => handleImageClick(item.id)}
           onRightClick={(e) => handleImageRightClick(e, item.file)}
+          registerEl={registerGridEl}
         />
       ))}
 
@@ -727,7 +838,22 @@ export default function Home() {
 
       {/* 3D latent-space navigator — mounts on demand, leaves the grid untouched */}
       {navigatorActive && (
-        <Navigator3D items={items} onExit={() => setNavigatorActive(false)} />
+        <Navigator3D
+          items={items}
+          onExit={() => setNavigatorActive(false)}
+          steerChannel={steerChannelRef}
+        />
+      )}
+
+      {/* Steer pad — floats above both views (z-index 300) so the same drag
+          steers whichever one is visible */}
+      {steerActive && (
+        <SteerPad
+          ctx={steerCtx}
+          embedText={embedText}
+          onSteer={handleSteer}
+          onSteerEnd={handleSteerEnd}
+        />
       )}
     </div>
   );
@@ -737,9 +863,12 @@ interface ImageCardProps {
   item: LaidOutItem;
   onClick: () => void;
   onRightClick: (e: React.MouseEvent) => void;
+  // Steer mode restyles tiles imperatively; cards opt in by registering their
+  // root element (null on unmount).
+  registerEl?: (id: string, el: HTMLDivElement | null) => void;
 }
 
-const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRightClick }) => {
+const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRightClick, registerEl }) => {
   const [loaded, setLoaded] = useState(false);
   const [videoPlaying, setVideoPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -791,6 +920,7 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRight
 
   return (
     <div
+      ref={(el) => registerEl?.(item.id, el)}
       className="image-item"
       style={{
         left: `${item.left}px`,
