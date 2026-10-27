@@ -42,3 +42,6 @@ next-env.d.ts
 
 # original images (too large for GitHub; only thumbnails are committed)
 /public/images/
+
+# precompute caches
+/.cache/

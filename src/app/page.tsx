@@ -1,1034 +1,503 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from "react";
-import type { PreTrainedTokenizer, PreTrainedModel, Processor, RawImage } from "@huggingface/transformers";
-import rawEmbeddings from "@/embeddings.json";
-import { MODEL } from "@/model";
-import Converge from "./Converge";
-import Navigator3D, { type SteerChannel } from "./Navigator3D";
-import SteerPad from "./SteerPad";
-import { buildSteerContext, OPACITY_FLOOR } from "./steer";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { embedImage, embedText, isTextModelLoaded } from "./embed";
+import {
+  fusedVector,
+  loadSpace,
+  placeUpload,
+  rankByCluster,
+  rankByText,
+  rankByVector,
+  type SpaceCluster,
+  type SpaceItem,
+} from "./space";
 
-interface ImageRecord {
-  id: string;
-  file: string;
-  thumb: string;
+// The cloud pulls in three.js; load it only when opened.
+const Cloud = dynamic(() => import("./Cloud"), { ssr: false });
+
+type Query =
+  | { kind: "image"; id: string }
+  | { kind: "text"; text: string; vec: Float32Array }
+  | { kind: "cluster"; index: number };
+
+interface Tile {
+  index: number;
+  x: number;
+  y: number;
   w: number;
   h: number;
-  embedding: number[];
-  kind?: "image" | "video"; // undefined/omitted == "image" for the precomputed dataset
+  rank: number;
 }
 
-interface LaidOutItem extends ImageRecord {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
+const GAP = 2;
+const MIN_ASPECT = 0.4;
+const MAX_ASPECT = 2.4;
+const REVEAL_STEP_MS = 12; // stagger between tiles when a new result set appears
+const REVEAL_MAX_RANK = 28; // tiles past this rank appear with the last group
+
+// Justified rows in rank order. Row height tapers from 1.6× to 1× the base
+// height, so the closest matches are also the largest.
+function layoutGrid(order: number[], items: SpaceItem[], width: number): { tiles: Tile[]; height: number } {
+  const base = Math.min(250, Math.max(140, width / 7));
+  const target = (row: number) => base * (1 + 0.6 * Math.exp(-row / 1.5));
+  // Extreme panoramas and strips are cropped (object-fit: cover) so one image
+  // cannot squeeze a whole row into a sliver.
+  const aspect = (i: number) => Math.min(MAX_ASPECT, Math.max(MIN_ASPECT, items[i].w / items[i].h || 1));
+  const tiles: Tile[] = [];
+  let y = 0;
+  let row: number[] = [];
+  let rowAspect = 0;
+  let rowIndex = 0;
+  const flush = (last: boolean) => {
+    let h = (width - GAP * (row.length - 1)) / rowAspect;
+    if (last) h = Math.min(h, target(rowIndex)); // an unfilled last row keeps its height
+    let x = 0;
+    for (const i of row) {
+      const w = h * aspect(i);
+      tiles.push({ index: i, x, y, w, h, rank: tiles.length });
+      x += w + GAP;
+    }
+    y += h + GAP;
+    rowIndex++;
+    row = [];
+    rowAspect = 0;
+  };
+  for (const i of order) {
+    const a = aspect(i);
+    if (row.length > 0) {
+      const t = target(rowIndex);
+      const without = (width - GAP * (row.length - 1)) / rowAspect;
+      const withIt = (width - GAP * row.length) / (rowAspect + a);
+      if (withIt < t && Math.abs(without - t) < Math.abs(withIt - t)) flush(false);
+    }
+    row.push(i);
+    rowAspect += a;
+  }
+  if (row.length > 0) flush(true);
+  return { tiles, height: Math.max(0, y - GAP) };
 }
 
-const VIDEO_POSTER_SEEK_FRACTION = 0.1; // seek 10% into the clip — frame 0 is often black/blank
+const VIDEO_POSTER_SEEK_FRACTION = 0.1; // frame 0 is often black
 
-// Minimum ms between mid-drag grid re-sorts while steering. The transform
-// transition (globals.css .steering) glides tiles between arrangements, so
-// this cadence reads as continuous without re-rendering the grid per frame.
-const STEER_REORDER_MS = 150;
-
-// Extract one representative frame from a video File via an offscreen
-// <video>+<canvas> — no ffmpeg, no server round-trip. The frame is embedded
-// exactly like an uploaded image; the original video stays playable in the
-// grid via its own object URL.
-async function extractVideoPosterFrame(
-  file: File
-): Promise<{ videoUrl: string; posterBlob: Blob; w: number; h: number }> {
+// One representative frame of a video, without a server round-trip.
+async function extractVideoPosterFrame(file: File): Promise<{ videoUrl: string; poster: Blob; w: number; h: number }> {
   const videoUrl = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.src = videoUrl;
   video.muted = true;
   video.playsInline = true;
-
   await new Promise<void>((resolve, reject) => {
     video.onloadedmetadata = () => resolve();
     video.onerror = () => reject(new Error("Failed to load video metadata"));
   });
-
-  const seekTime = Math.min(video.duration * VIDEO_POSTER_SEEK_FRACTION, video.duration || 0);
   await new Promise<void>((resolve, reject) => {
     video.onseeked = () => resolve();
     video.onerror = () => reject(new Error("Failed to seek video"));
-    video.currentTime = seekTime;
+    video.currentTime = (video.duration || 0) * VIDEO_POSTER_SEEK_FRACTION;
   });
-
-  const w = video.videoWidth;
-  const h = video.videoHeight;
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas 2D context unavailable");
-  ctx.drawImage(video, 0, 0, w, h);
-
-  const posterBlob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("Canvas toBlob failed"))),
-      "image/webp",
-      0.9
-    );
-  });
-
-  return { videoUrl, posterBlob, w, h };
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext("2d")?.drawImage(video, 0, 0);
+  const poster = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Canvas toBlob failed"))), "image/webp", 0.9)
+  );
+  return { videoUrl, poster, w: video.videoWidth, h: video.videoHeight };
 }
 
-// Precomputed dataset IDs are always "NNN_..." (filename-derived, see
-// scripts/precompute.ts) — this prefix can never collide with them.
-let uploadIdSeq = 0;
-function nextUploadId(): string {
-  uploadIdSeq += 1;
-  return `upload-${Date.now()}-${uploadIdSeq}`;
-}
+let uploadSeq = 0;
 
 export default function Home() {
+  const [space] = useState(loadSpace);
+  const clusters: SpaceCluster[] = space.clusters;
+  const [items, setItems] = useState<SpaceItem[]>(space.items);
   const [mounted, setMounted] = useState(false);
-  const [queryId, setQueryId] = useState<string | null>(null);
-  const [history, setHistory] = useState<string[]>([]);
-  const [showHelp, setShowHelp] = useState(false);
-  const [dimensions, setDimensions] = useState({ w: 1200, h: 800 });
-  // Converge: a self-contained pairwise-choice overlay. It reads the same
-  // embeddings but never touches queryId/textVec/neighborhood, so the main
-  // grid's geometry is frozen while it runs.
-  const [convergeActive, setConvergeActive] = useState(false);
-  // 3D navigator: a self-contained WebGL overlay over the same embeddings. Like
-  // Converge, it never touches the main grid's queryId/textVec/neighborhood.
-  const [navigatorActive, setNavigatorActive] = useState(false);
-  // Steer: a floating 2D pad that synthesizes a query vector per animation
-  // frame. Its relevance is painted onto the grid imperatively (never through
-  // React state, so drags stay at 60fps) and forwarded to the 3D navigator
-  // through steerChannelRef when that overlay is open. steerRank re-sorts the
-  // grid to the steered ranking on a throttled cadence — tiles glide to their
-  // new spots via the transform transition.
-  const [steerActive, setSteerActive] = useState(false);
-  const [steerRank, setSteerRank] = useState<string[] | null>(null);
+  const [query, setQuery] = useState<Query | null>(null);
+  const [history, setHistory] = useState<Query[]>([]);
+  const [revealKey, setRevealKey] = useState(0);
+  const [width, setWidth] = useState(1200);
+  const [cloudOpen, setCloudOpen] = useState(false);
 
-  // Text content-search state
   const [searchTerm, setSearchTerm] = useState("");
-  const [textVec, setTextVec] = useState<Float32Array | null>(null);
-  const [searchStatus, setSearchStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
 
-  // Upload state: files the user drops/picks are embedded client-side and
-  // merged into `items` for this session only — never written to disk, gone
-  // on refresh.
-  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
-  const [isDraggingFile, setIsDraggingFile] = useState(false);
-
-  const helpRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Cache the lazily-loaded tokenizer + text model so only the first search
-  // pays the load/download cost.
-  const textModelRef = useRef<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel } | null>(null);
-  const textModelPromiseRef = useRef<Promise<{ tokenizer: PreTrainedTokenizer; model: PreTrainedModel }> | null>(null);
-  // Same lazy-load-once pattern for embedding uploaded images/video frames.
-  const visionModelRef = useRef<{ processor: Processor; model: PreTrainedModel } | null>(null);
-  // Monotonic token to invalidate in-flight searches when the user clears the
-  // box, submits a new query, or clicks away before the previous one resolves.
-  const searchSeqRef = useRef(0);
-  // Same pattern for uploads: dropping a new batch while a previous one is
-  // still embedding invalidates the stale batch's in-flight loop.
-  const uploadSeqRef = useRef(0);
-  // Counts nested dragenter/dragleave (fired on every child element under the
-  // cursor) so the drop-zone overlay only toggles on the outermost enter/leave.
-  const dragCounterRef = useRef(0);
-  // Steer plumbing: live grid tiles by id (for imperative styling), the 3D
-  // navigator's steer methods (populated while the overlay is mounted), and
-  // the last emitted relevance (reapplied after React re-renders the grid).
-  const gridElsRef = useRef(new Map<string, HTMLDivElement>());
-  const steerChannelRef = useRef<SteerChannel | null>(null);
-  const lastSteerRef = useRef<{ relevance: Float32Array; topIndex: number } | null>(null);
-  const lastReorderRef = useRef(0); // timestamp of the last mid-drag re-sort
+  const searchSeq = useRef(0);
+  const dragDepth = useRef(0);
 
-  // Items: the precomputed dataset, plus anything dropped in this session.
-  // Lazy initializer preserves the old useMemo's "compute once" semantics for
-  // the static import, while making the array appendable via setItems.
-  const [items, setItems] = useState<(ImageRecord & { vec: Float32Array })[]>(() =>
-    (rawEmbeddings as ImageRecord[]).map(item => ({
-      ...item,
-      vec: new Float32Array(item.embedding),
-    }))
-  );
+  const indexById = useMemo(() => new Map(items.map((it, i) => [it.id, i])), [items]);
+  const queryRef = useRef<Query | null>(null);
+  queryRef.current = query;
+  const hashRef = useRef(""); // the hash this page set last, so its own change is ignored
 
-  // Map for fast O(1) retrieval by ID
-  const byId = useMemo(() => {
-    return new Map(items.map(item => [item.id, item]));
-  }, [items]);
-
-  // Packed matrix + centroid for the Steer pad. Keyed on the items array
-  // identity, so uploads (which replace the array) invalidate it automatically.
-  const steerCtx = useMemo(
-    () => (steerActive && items.length > 0 ? buildSteerContext(items) : null),
-    [steerActive, items]
-  );
-
-  // Set mounted and dimensions client-side, initialize seed query
-  useEffect(() => {
-    setMounted(true);
-
-    const handleResize = () => {
-      setDimensions({
-        w: window.innerWidth,
-        h: window.innerHeight
-      });
-    };
-
-    window.addEventListener("resize", handleResize);
-    handleResize();
-
-    // Determine initial seed image
-    if (items.length > 0) {
-      let initialId = "";
-      const hash = window.location.hash.substring(1);
-      if (hash && byId.has(hash)) {
-        initialId = hash;
-      } else {
-        // Pick a random image to seed the experience
-        const randomIndex = Math.floor(Math.random() * items.length);
-        initialId = items[randomIndex].id;
-      }
-      setQueryId(initialId);
+  // Every query change goes through here: it records history, puts image
+  // queries in the URL hash (browser back/forward works), and restarts the
+  // reveal from the top of the page.
+  const go = useCallback((next: Query, record = true) => {
+    const prev = queryRef.current;
+    if (record && prev) setHistory((h) => [...h, prev]);
+    setQuery(next);
+    setSearchTerm(next.kind === "text" ? next.text : "");
+    if (next.kind === "image" && window.location.hash.slice(1) !== next.id) {
+      hashRef.current = next.id;
+      window.location.hash = next.id;
     }
-
-    return () => {
-      window.removeEventListener("resize", handleResize);
-    };
-  }, [items, byId]);
-
-  // Listen to hashchange events (native browser back/forward support)
-  useEffect(() => {
-    if (!mounted) return;
-
-    const handleHashChange = () => {
-      const hash = window.location.hash.substring(1);
-      if (hash && byId.has(hash) && hash !== queryId) {
-        setQueryId(hash);
-      }
-    };
-
-    window.addEventListener("hashchange", handleHashChange);
-    return () => {
-      window.removeEventListener("hashchange", handleHashChange);
-    };
-  }, [mounted, queryId, byId]);
-
-  // Close help overlay if clicked outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (showHelp && helpRef.current && !helpRef.current.contains(event.target as Node)) {
-        setShowHelp(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
-    };
-  }, [showHelp]);
-
-  // Brute-force Cosine Similarity (Dot Product over pre-normalized vectors)
-  const dot = (a: Float32Array, b: Float32Array) => {
-    let s = 0;
-    const len = a.length;
-    for (let i = 0; i < len; i++) s += a[i] * b[i];
-    return s;
-  };
-
-  // Neighborhood: rank all items against an effective query vector. The query
-  // is either a typed text embedding (content search) or, falling back, the
-  // clicked image's own vector (visual exploration).
-  const neighborhood = useMemo(() => {
-    if (items.length === 0) return [];
-
-    let q: Float32Array | null = textVec;
-    if (!q) {
-      if (!queryId) return [];
-      const queryItem = byId.get(queryId);
-      if (!queryItem) return [];
-      q = queryItem.vec;
-    }
-
-    const query = q;
-    return items
-      .map(it => ({ it, s: dot(query, it.vec) }))
-      .sort((a, b) => b.s - a.s)
-      .map(x => x.it);
-  }, [queryId, textVec, items, byId]);
-
-  // Grid display order: the steered ranking while steering, else the
-  // neighborhood. Items missing from the rank (e.g. an upload that landed
-  // mid-drag) keep their neighborhood position at the end.
-  const displayItems = useMemo(() => {
-    if (!steerActive || !steerRank) return neighborhood;
-    const ranked: typeof neighborhood = [];
-    const seen = new Set<string>();
-    for (const id of steerRank) {
-      const it = byId.get(id);
-      if (it) {
-        ranked.push(it);
-        seen.add(id);
-      }
-    }
-    for (const it of neighborhood) if (!seen.has(it.id)) ranked.push(it);
-    return ranked;
-  }, [neighborhood, steerActive, steerRank, byId]);
-
-  // Layout geometry computation (Justified Grid)
-  const flatLaidOutItems = useMemo(() => {
-    if (displayItems.length === 0) return [];
-
-    const containerW = dimensions.w;
-    const containerH = dimensions.h;
-    const targetH = Math.max(180, Math.min(320, containerH / 4.5));
-    const gap = 1;
-
-    const laidOut: LaidOutItem[] = [];
-    let currentTop = 0;
-    let currentRow: ImageRecord[] = [];
-    let currentRowWidth = 0;
-
-    for (let i = 0; i < displayItems.length; i++) {
-      const item = displayItems[i];
-      const aspect = item.w / item.h;
-      const itemW = aspect * targetH;
-      const additionalW = currentRow.length > 0 ? gap + itemW : itemW;
-
-      if (currentRowWidth + additionalW > containerW && currentRow.length > 0) {
-        // Committing this row: scale it down to exactly fit containerW
-        const numGaps = currentRow.length - 1;
-        const availableW = containerW - numGaps * gap;
-        const sumAspect = currentRow.reduce((sum, it) => sum + (it.w / it.h), 0);
-        const rowH = availableW / sumAspect;
-
-        let currentLeft = 0;
-        for (const rowItem of currentRow) {
-          const finalW = (rowItem.w / rowItem.h) * rowH;
-          laidOut.push({
-            ...rowItem,
-            left: currentLeft,
-            top: currentTop,
-            width: finalW,
-            height: rowH,
-          });
-          currentLeft += finalW + gap;
-        }
-
-        currentTop += rowH + gap;
-        currentRow = [item];
-        currentRowWidth = itemW;
-      } else {
-        currentRow.push(item);
-        currentRowWidth += additionalW;
-      }
-    }
-
-    // Justify the last row if there are remaining items
-    if (currentRow.length > 0) {
-      const numGaps = currentRow.length - 1;
-      const availableW = containerW - numGaps * gap;
-      const sumAspect = currentRow.reduce((sum, it) => sum + (it.w / it.h), 0);
-      const rowH = availableW / sumAspect;
-
-      let currentLeft = 0;
-      for (const rowItem of currentRow) {
-        const finalW = (rowItem.w / rowItem.h) * rowH;
-        laidOut.push({
-          ...rowItem,
-          left: currentLeft,
-          top: currentTop,
-          width: finalW,
-          height: rowH,
-        });
-        currentLeft += finalW + gap;
-      }
-    }
-
-    return laidOut;
-  }, [displayItems, dimensions]);
-
-  // Left click (hop to neighbor). Clicking a result hands control back to
-  // image-to-image visual exploration, exiting text-search mode.
-  const handleImageClick = (id: string) => {
-    if (textVec || searchStatus) {
-      searchSeqRef.current++;
-      setTextVec(null);
-      setSearchTerm("");
-      setSearchStatus(null);
-    }
-    if (queryId !== id) {
-      if (queryId) setHistory(prev => [...prev, queryId]);
-      setQueryId(id);
-      window.location.hash = id;
-    }
-  };
-
-  // Lazy-load SigLIP's text tower once and cache it for every consumer (the
-  // search bar and the Steer pad share the same model instance). The in-flight
-  // promise is memoized so concurrent callers (the pad embeds its pole words
-  // in parallel) share one load instead of racing four.
-  const ensureTextModel = useCallback(() => {
-    if (!textModelPromiseRef.current) {
-      textModelPromiseRef.current = (async () => {
-        const { AutoTokenizer, SiglipTextModel, env } = await import("@huggingface/transformers");
-        // Fetch from the HuggingFace CDN; skip spurious local-path lookups.
-        env.allowLocalModels = false;
-        const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
-        const model = await SiglipTextModel.from_pretrained(MODEL, { dtype: "q8" });
-        const cached = { tokenizer, model };
-        textModelRef.current = cached;
-        return cached;
-      })().catch(err => {
-        textModelPromiseRef.current = null; // failed loads may be retried
-        throw err;
-      });
-    }
-    return textModelPromiseRef.current;
+    setRevealKey((k) => k + 1);
+    window.scrollTo({ top: 0 });
   }, []);
 
-  // Embed one string with the text tower. L2-normalized so dot product equals
-  // cosine similarity, matching how the image vectors are normalized in
-  // scripts/precompute.ts.
-  const embedText = useCallback(async (text: string): Promise<Float32Array> => {
-    const { tokenizer, model } = await ensureTextModel();
-    // SigLIP expects fixed-length, padded (max_length 64) token sequences.
-    const inputs = tokenizer(text, { padding: "max_length", truncation: true });
-    const { pooler_output } = await model(inputs);
-    const v = Array.from(pooler_output.data as Float32Array);
-    const norm = Math.hypot(...v) || 1;
-    return new Float32Array(v.map(x => x / norm));
-  }, [ensureTextModel]);
+  const randomImage = useCallback((): Query => {
+    return { kind: "image", id: items[Math.floor(Math.random() * items.length)].id };
+  }, [items]);
 
-  // Embed a typed query with SigLIP's text tower (client-side, lazy) and use
-  // it to drive the ranking. The image vectors already live in this same space.
-  const runTextSearch = async (text: string) => {
-    const query = text.trim();
-    // Each call gets a token; later calls (or clearing) bump it, so a slow
-    // request that resolves after the user has moved on becomes a no-op.
-    const seq = ++searchSeqRef.current;
-    if (!query) {
-      setTextVec(null);
-      setSearchStatus(null);
-      return;
-    }
+  useEffect(() => {
+    setMounted(true);
+    const hash = decodeURIComponent(window.location.hash.slice(1));
+    const start = space.items.find((it) => it.id === hash) ?? space.items[Math.floor(Math.random() * space.items.length)];
+    setQuery({ kind: "image", id: start.id });
+  }, [space]);
 
-    try {
-      if (!textModelRef.current) setSearchStatus("Loading model…");
-      await ensureTextModel();
-      if (searchSeqRef.current !== seq) return;
+  useEffect(() => {
+    const onHash = () => {
+      const id = decodeURIComponent(window.location.hash.slice(1));
+      if (id === hashRef.current) return;
+      hashRef.current = id;
+      if (indexById.has(id)) go({ kind: "image", id }, false);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, [go, indexById]);
 
-      setSearchStatus("Searching…");
-      const vec = await embedText(query);
-      if (searchSeqRef.current !== seq) return;
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    ro.observe(el);
+    setWidth(el.clientWidth);
+    return () => ro.disconnect();
+  }, [mounted]);
 
-      setTextVec(vec);
-      setSearchStatus(null);
-    } catch (err) {
-      console.error("Text search failed:", err);
-      if (searchSeqRef.current === seq) setSearchStatus("Search failed");
-    }
+  const order = useMemo(() => {
+    if (!query) return items.map((_, i) => i);
+    if (query.kind === "text") return rankByText(query.vec, items);
+    if (query.kind === "cluster") return rankByCluster(query.index, items);
+    const q = indexById.get(query.id);
+    if (q === undefined) return items.map((_, i) => i);
+    return [q, ...rankByVector(items[q].fused, items).filter((i) => i !== q)];
+  }, [query, items, indexById]);
+
+  const grid = useMemo(() => layoutGrid(order, items, width), [order, items, width]);
+
+  const queryItem = query?.kind === "image" ? items[indexById.get(query.id) ?? -1] : undefined;
+
+  const openImage = useCallback(
+    (id: string) => {
+      searchSeq.current++; // a search still loading must not replace this
+      go({ kind: "image", id });
+    },
+    [go]
+  );
+
+  const back = () => {
+    const prev = history[history.length - 1];
+    if (!prev) return;
+    setHistory((h) => h.slice(0, -1));
+    go(prev, false);
   };
 
-  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      runTextSearch(searchTerm);
+  // ---- text search ------------------------------------------------------------
+
+  const runSearch = async (text: string) => {
+    const seq = ++searchSeq.current;
+    if (!text.trim()) return;
+    try {
+      setStatus(isTextModelLoaded() ? "Searching…" : "Loading text model (once, about 280 MB)…");
+      const vec = await embedText(text);
+      if (searchSeq.current !== seq) return;
+      setStatus(null);
+      go({ kind: "text", text: text.trim(), vec });
+    } catch (err) {
+      console.error("Text search failed:", err);
+      if (searchSeq.current === seq) setStatus("Search failed");
     }
   };
 
   const clearSearch = () => {
-    searchSeqRef.current++;
+    searchSeq.current++;
     setSearchTerm("");
-    setTextVec(null);
-    setSearchStatus(null);
+    setStatus(null);
+    if (query?.kind === "text") back();
   };
 
-  // ---- Steer mode -----------------------------------------------------------
+  // ---- uploads ----------------------------------------------------------------
 
-  // ImageCards register their root elements here so steering can restyle them
-  // without React. Stable identity — doesn't defeat ImageCard's React.memo.
-  const registerGridEl = useCallback((id: string, el: HTMLDivElement | null) => {
-    if (el) gridElsRef.current.set(id, el);
-    else gridElsRef.current.delete(id);
-  }, []);
-
-  // Paint relevance onto the grid: opacity + a small scale bump per tile, a
-  // ring on the top match. Compositor-only properties, no layout reads, no
-  // React — this runs once per animation frame during a drag, and there are
-  // deliberately NO transitions on opacity so the response is instant. The
-  // scale bump goes through the --steer-scale custom property because the
-  // transform itself belongs to the stylesheet (it carries tile position).
-  const applySteerToGrid = useCallback((relevance: Float32Array, topIndex: number) => {
-    const els = gridElsRef.current;
-    const m = Math.min(items.length, relevance.length); // guard mid-upload length skew
-    for (let i = 0; i < m; i++) {
-      const el = els.get(items[i].id);
-      if (!el) continue;
-      const r = relevance[i];
-      el.style.opacity = String(OPACITY_FLOOR + (1 - OPACITY_FLOOR) * r);
-      el.style.setProperty("--steer-scale", (1 + 0.035 * r * r).toFixed(4));
-      if (i === topIndex) {
-        el.style.outline = "2px solid rgba(125, 211, 252, 0.85)";
-        el.style.zIndex = "5";
-      } else if (el.style.outline) {
-        el.style.outline = "";
-        el.style.zIndex = "";
-      }
-    }
-  }, [items]);
-
-  // The steered ranking as item ids, most relevant first. Relevance is a
-  // monotonic transform of the scores, so sorting by it preserves the true
-  // cosine order.
-  const rankFromRelevance = useCallback((relevance: Float32Array) => {
-    const m = Math.min(items.length, relevance.length);
-    const idx = Array.from({ length: m }, (_, i) => i);
-    idx.sort((a, b) => relevance[b] - relevance[a]);
-    return idx.map(i => items[i].id);
-  }, [items]);
-
-  const handleSteer = useCallback(
-    (relevance: Float32Array, topIndex: number) => {
-      lastSteerRef.current = { relevance, topIndex };
-      applySteerToGrid(relevance, topIndex);
-      steerChannelRef.current?.applySteer(relevance, topIndex);
-      // Mid-drag re-sort, throttled: React relayouts every STEER_REORDER_MS
-      // while the transform transition glides tiles between arrangements.
-      // Pointless while the 3D overlay hides the grid.
-      if (!navigatorActive) {
-        const now = performance.now();
-        if (now - lastReorderRef.current >= STEER_REORDER_MS) {
-          lastReorderRef.current = now;
-          setSteerRank(rankFromRelevance(relevance));
-        }
-      }
-    },
-    [applySteerToGrid, rankFromRelevance, navigatorActive]
-  );
-
-  const handleSteerEnd = useCallback(() => {
-    // One exact, unthrottled sort at the release position.
-    if (lastSteerRef.current && !navigatorActive) {
-      setSteerRank(rankFromRelevance(lastSteerRef.current.relevance));
-    }
-    steerChannelRef.current?.steerEnd();
-  }, [rankFromRelevance, navigatorActive]);
-
-  // Re-renders (resize reflow, uploads) mount fresh tiles without steer
-  // styles — repaint them from the last emitted relevance.
-  useLayoutEffect(() => {
-    if (!steerActive || !lastSteerRef.current) return;
-    applySteerToGrid(lastSteerRef.current.relevance, lastSteerRef.current.topIndex);
-  }, [steerActive, flatLaidOutItems, applySteerToGrid]);
-
-  // Steer off: remove every inline steer style so the stylesheet (including
-  // :hover scale/outline) takes back over exactly, drop the steered order,
-  // and reset the 3D view.
-  useEffect(() => {
-    if (steerActive) return;
-    for (const el of gridElsRef.current.values()) {
-      el.style.removeProperty("opacity");
-      el.style.removeProperty("--steer-scale");
-      el.style.removeProperty("outline");
-      el.style.removeProperty("z-index");
-    }
-    lastSteerRef.current = null;
-    setSteerRank(null);
-    steerChannelRef.current?.clearSteer();
-  }, [steerActive]);
-
-  // Embed one already-loaded RawImage with SigLIP's vision tower (client-side,
-  // lazy — mirrors runTextSearch's load-once-and-cache pattern above).
-  const embedRawImage = async (raw: RawImage): Promise<Float32Array> => {
-    let cached = visionModelRef.current;
-    if (!cached) {
-      const { AutoProcessor, SiglipVisionModel, env } = await import("@huggingface/transformers");
-      env.allowLocalModels = false;
-      const processor = await AutoProcessor.from_pretrained(MODEL);
-      const model = await SiglipVisionModel.from_pretrained(MODEL, { dtype: "q8" });
-      cached = { processor, model };
-      visionModelRef.current = cached;
-    }
-    const inputs = await cached.processor(raw);
-    const { pooler_output } = await cached.model(inputs);
-    const v = Array.from(pooler_output.data as Float32Array);
-    const norm = Math.hypot(...v) || 1;
-    return new Float32Array(v.map(x => x / norm));
-  };
-
-  // Embed dropped/picked files client-side and merge them into `items`.
-  // Images embed directly; videos get a representative frame extracted first
-  // (extractVideoPosterFrame) and that frame is embedded the same way. Files
-  // are processed sequentially, not concurrently — ONNX Runtime Web inference
-  // is CPU-bound and largely serializes anyway, and sequential keeps the
-  // done/total progress readout exact without a concurrency-pool utility.
-  const ingestFiles = async (files: File[]) => {
-    const seq = ++uploadSeqRef.current;
-    const imageFiles = files.filter(f => f.type.startsWith("image/"));
-    const videoFiles = files.filter(f => f.type.startsWith("video/"));
-    const total = imageFiles.length + videoFiles.length;
-    if (total === 0) return;
-
-    const { RawImage } = await import("@huggingface/transformers");
+  const ingest = async (files: File[]) => {
+    const media = files.filter((f) => f.type.startsWith("image/") || f.type.startsWith("video/"));
+    if (media.length === 0) return;
+    const added: SpaceItem[] = [];
     let done = 0;
-    setUploadStatus(`Embedding 0 / ${total}…`);
-    const newRecords: (ImageRecord & { vec: Float32Array })[] = [];
-
+    setStatus(`Embedding 0 / ${media.length}…`);
     try {
-      for (const file of imageFiles) {
-        if (uploadSeqRef.current !== seq) return;
-        const objectUrl = URL.createObjectURL(file);
-        const raw = await RawImage.fromURL(objectUrl);
-        const vec = await embedRawImage(raw);
-        newRecords.push({
-          id: nextUploadId(),
-          file: objectUrl,
-          thumb: objectUrl,
-          w: raw.width,
-          h: raw.height,
-          embedding: Array.from(vec),
-          vec,
-          kind: "image",
-        });
-        done++;
-        setUploadStatus(`Embedding ${done} / ${total}…`);
-      }
-
-      for (const file of videoFiles) {
-        if (uploadSeqRef.current !== seq) return;
-        const { videoUrl, posterBlob, w, h } = await extractVideoPosterFrame(file);
-        const posterUrl = URL.createObjectURL(posterBlob);
-        const raw = await RawImage.fromBlob(posterBlob);
-        const vec = await embedRawImage(raw);
-        newRecords.push({
-          id: nextUploadId(),
+      for (const file of media) {
+        const isVideo = file.type.startsWith("video/");
+        let blob: Blob = file;
+        let videoUrl: string | undefined;
+        let w = 0;
+        let h = 0;
+        if (isVideo) {
+          const frame = await extractVideoPosterFrame(file);
+          blob = frame.poster;
+          videoUrl = frame.videoUrl;
+          w = frame.w;
+          h = frame.h;
+        } else {
+          const bitmap = await createImageBitmap(file);
+          w = bitmap.width;
+          h = bitmap.height;
+          bitmap.close();
+        }
+        const { siglip, dino } = await embedImage(blob);
+        const fused = fusedVector(siglip, dino);
+        const base = [...items, ...added];
+        const place = placeUpload(fused, base);
+        added.push({
+          id: `upload-${Date.now()}-${++uploadSeq}`,
+          thumb: URL.createObjectURL(blob),
           file: videoUrl,
-          thumb: posterUrl,
           w,
           h,
-          embedding: Array.from(vec),
-          vec,
-          kind: "video",
+          kind: isVideo ? "video" : "image",
+          siglip,
+          fused,
+          tags: [],
+          ...place,
         });
         done++;
-        setUploadStatus(`Embedding ${done} / ${total}…`);
+        setStatus(`Embedding ${done} / ${media.length}…`);
       }
-
-      if (uploadSeqRef.current !== seq) return;
-      setItems(prev => [...prev, ...newRecords]);
-      setUploadStatus(null);
+      setItems((prev) => [...prev, ...added]);
+      setStatus(null);
+      if (added.length > 0) openImage(added[0].id);
     } catch (err) {
-      console.error("Upload embedding failed:", err);
-      if (uploadSeqRef.current === seq) setUploadStatus("Upload failed");
+      console.error("Upload failed:", err);
+      setStatus("Upload failed");
     }
   };
 
-  const handleDragOver = (e: React.DragEvent) => {
+  const onDragEnter = (e: React.DragEvent) => {
     e.preventDefault();
+    if (!e.dataTransfer.types.includes("Files")) return;
+    dragDepth.current++;
+    setDragging(true);
   };
-  const handleDragEnter = (e: React.DragEvent) => {
+  const onDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
-    if (e.dataTransfer.types.includes("Files")) {
-      dragCounterRef.current += 1;
-      setIsDraggingFile(true);
-    }
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
   };
-  const handleDragLeave = (e: React.DragEvent) => {
+  const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
-    dragCounterRef.current -= 1;
-    if (dragCounterRef.current <= 0) {
-      dragCounterRef.current = 0;
-      setIsDraggingFile(false);
-    }
-  };
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    dragCounterRef.current = 0;
-    setIsDraggingFile(false);
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length > 0) ingestFiles(files);
-  };
-  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    if (files.length > 0) ingestFiles(files);
-    e.target.value = "";
+    dragDepth.current = 0;
+    setDragging(false);
+    ingest(Array.from(e.dataTransfer.files));
   };
 
-  // Right click (open original image in new tab)
-  const handleImageRightClick = (e: React.MouseEvent, fileUrl: string) => {
-    e.preventDefault();
-    window.open(fileUrl, "_blank");
-  };
+  if (!mounted) return <div className="app" />;
 
-  // Navigation handlers
-  const handleBack = () => {
-    if (history.length > 0) {
-      const nextHistory = [...history];
-      const prevId = nextHistory.pop()!;
-      setHistory(nextHistory);
-      setQueryId(prevId);
-      window.location.hash = prevId;
-    }
-  };
-
-  const handleHome = () => {
-    if (items.length > 0) {
-      const randomIndex = Math.floor(Math.random() * items.length);
-      const randomId = items[randomIndex].id;
-      if (queryId) {
-        setHistory(prev => [...prev, queryId]);
-      }
-      setQueryId(randomId);
-      window.location.hash = randomId;
-    }
-  };
-
-  if (!mounted) {
-    return <div className="w-screen h-screen bg-black" />;
-  }
-
-  // Developer/Empty state warning — also a drop target, so a first-time user
-  // with no precomputed dataset can start populating the gallery immediately.
-  if (items.length === 0) {
-    return (
-      <div
-        className="w-screen h-screen bg-[#050505] flex flex-col items-center justify-center p-8 text-center"
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragEnter}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-      >
-        <div className="max-w-md bg-neutral-900 border border-neutral-800 p-8 rounded-2xl shadow-2xl backdrop-blur-md">
-          <h2 className="text-xl font-semibold mb-4 text-white">Welcome to River</h2>
-          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
-            Drag and drop images or videos here to try it out instantly — added for this session only.
-          </p>
-          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
-            To build a permanent dataset instead, drop your image files (JPEG, PNG, WebP) into:
-          </p>
-          <code className="block bg-black text-emerald-400 p-3 rounded-lg text-xs font-mono mb-6 border border-neutral-800 text-left select-all">
-            public/images/
-          </code>
-          <p className="text-neutral-400 mb-6 text-sm leading-relaxed">
-            Then run the precomputation script to generate embeddings and thumbnails:
-          </p>
-          <code className="block bg-black text-emerald-400 p-3 rounded-lg text-xs font-mono mb-6 border border-neutral-800 text-left select-all">
-            npm run precompute
-          </code>
-          <p className="text-neutral-500 text-xs">
-            Once run, the embeddings will be saved to <span className="font-mono text-neutral-400">src/embeddings.json</span> and the app will refresh.
-          </p>
-        </div>
-        {uploadStatus && <div className="status-info" style={{ position: "fixed", bottom: 24 }}>{uploadStatus}</div>}
-        {isDraggingFile && (
-          <div className="drop-zone-overlay">
-            <div className="drop-zone-message">Drop images or videos to add them to this session</div>
-          </div>
-        )}
-      </div>
-    );
-  }
+  const cluster = queryItem ? clusters[queryItem.cluster] : query?.kind === "cluster" ? clusters[query.index] : undefined;
+  const parent = cluster && cluster.parent !== null ? clusters[cluster.parent] : undefined;
 
   return (
     <div
-      className={`grid-container${steerActive ? " steering" : ""}`}
-      onDragOver={handleDragOver}
-      onDragEnter={handleDragEnter}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
+      className="app"
+      onDragOver={(e) => e.preventDefault()}
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
     >
-      {isDraggingFile && (
-        <div className="drop-zone-overlay">
-          <div className="drop-zone-message">Drop images or videos to add them to this session</div>
+      <header className="bar">
+        <div className="bar-group">
+          <button className="btn" onClick={back} disabled={history.length === 0} title="Previous result" aria-label="Back">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+            <span className="btn-label">Back</span>
+          </button>
+          <button className="btn" onClick={() => go(randomImage())} title="Start from a random image" aria-label="Shuffle">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="16 3 21 3 21 8" />
+              <line x1="4" y1="20" x2="21" y2="3" />
+              <polyline points="21 16 21 21 16 21" />
+              <line x1="15" y1="15" x2="21" y2="21" />
+              <line x1="4" y1="4" x2="9" y2="9" />
+            </svg>
+            <span className="btn-label">Shuffle</span>
+          </button>
+          <button className="btn btn-primary" onClick={() => setCloudOpen(true)} title="See the board as a cloud of aesthetics">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="7" cy="12" r="2" />
+              <circle cx="16" cy="7" r="2" />
+              <circle cx="17" cy="16" r="2" />
+            </svg>
+            Cloud
+          </button>
         </div>
-      )}
-      {/* Floating control overlay */}
-      <div className="controls-panel">
-        <button
-          className="control-btn"
-          onClick={handleBack}
-          disabled={history.length === 0}
-          title="Back to previous query"
+        <form
+          className="search"
+          onSubmit={(e) => {
+            e.preventDefault();
+            runSearch(searchTerm);
+          }}
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="19" y1="12" x2="5" y2="12"></line>
-            <polyline points="12 19 5 12 12 5"></polyline>
-          </svg>
-          Back
-        </button>
-        <button
-          className="control-btn"
-          onClick={handleHome}
-          title="Jump to random seed image"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
-            <polyline points="9 22 9 12 15 12 15 22"></polyline>
-          </svg>
-          Home
-        </button>
-        <button
-          className="control-btn"
-          onClick={() => setConvergeActive(true)}
-          title="Converge: pick one aesthetic direction by pairwise choice"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="4 7 9 12 4 17"></polyline>
-            <polyline points="20 7 15 12 20 17"></polyline>
-          </svg>
-          Converge
-        </button>
-        <button
-          className="control-btn"
-          onClick={() => setNavigatorActive(true)}
-          title="Explore embeddings as a 3D latent-space cloud"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 2 21 7v10l-9 5-9-5V7z"></path>
-            <path d="M12 2v20"></path>
-            <path d="M21 7l-9 5-9-5"></path>
-          </svg>
-          Explore 3D
-        </button>
-        <button
-          className={`control-btn${steerActive ? " active" : ""}`}
-          onClick={() => setSteerActive(prev => !prev)}
-          title="Steer: drag a 2D pad between word poles to glide the ranking"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="4"></rect>
-            <circle cx="14" cy="10" r="2" fill="currentColor" stroke="none"></circle>
-          </svg>
-          Steer
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*,video/*"
-          multiple
-          className="visually-hidden"
-          onChange={handleFileInputChange}
-        />
-        <button
-          className="control-btn"
-          onClick={() => fileInputRef.current?.click()}
-          title="Add your own images or videos to this session"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
-          </svg>
-          Add
-        </button>
-        <div className="divider"></div>
-
-        {/* Content search: type words to find images by what they depict */}
-        <div className="search-box">
-          <svg className="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="11" cy="11" r="8"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          <svg className="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="11" cy="11" r="7" />
+            <line x1="20" y1="20" x2="16.5" y2="16.5" />
           </svg>
           <input
             className="search-input"
             type="text"
             value={searchTerm}
-            placeholder="Search by content…"
+            placeholder="Search by content or aesthetic"
             onChange={(e) => setSearchTerm(e.target.value)}
-            onKeyDown={handleSearchKeyDown}
             spellCheck={false}
+            aria-label="Search images"
           />
-          {(searchTerm || textVec) && (
-            <button className="search-clear" onClick={clearSearch} title="Clear search">
-              ✕
+          {searchTerm && (
+            <button type="button" className="search-clear" onClick={clearSearch} aria-label="Clear search">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <line x1="6" y1="6" x2="18" y2="18" />
+                <line x1="18" y1="6" x2="6" y2="18" />
+              </svg>
             </button>
           )}
+        </form>
+        <div className="bar-group bar-end">
+          <span className="status">{status ?? `${items.length} images`}</span>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            hidden
+            onChange={(e) => {
+              ingest(Array.from(e.target.files ?? []));
+              e.target.value = "";
+            }}
+          />
+          <button className="btn" onClick={() => fileInputRef.current?.click()} title="Add images or videos to this session" aria-label="Add">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            <span className="btn-label">Add</span>
+          </button>
         </div>
+      </header>
 
-        <div className="divider"></div>
-        <button
-          className="control-btn help-modal-trigger"
-          onClick={() => setShowHelp(prev => !prev)}
-          title="Show instructions"
-        >
-          ?
-        </button>
-
-        {/* Status display: upload progress, search progress, or item count */}
-        <span className="status-info">
-          {uploadStatus
-            ? uploadStatus
-            : searchStatus
-              ? searchStatus
-              : textVec
-                ? `Results for “${searchTerm.trim()}”`
-                : `${items.length} items`}
-        </span>
-
-        {/* Help popover */}
-        <div ref={helpRef} className={`help-tooltip ${showHelp ? "visible" : ""}`}>
-          <h3>River Exploration</h3>
-          <p>This is a lateral exploration tool for your local image library, connected via SigLIP ViT-L/16 (384px) embeddings.</p>
-          <ul>
-            <li><span className="key-hint">Search</span> by content — type what you&apos;re looking for (e.g. &quot;buttons&quot;, &quot;a red flower&quot;) and press Enter to rank images by what they depict, not their filename.</li>
-            <li><span className="key-hint">Left-Click</span> an image to refill the grid with its visually nearest neighbors.</li>
-            <li><span className="key-hint">Right-Click</span> an image to open the high-res original in a new tab.</li>
-            <li><span className="key-hint">Converge</span> mode — forced pairwise choices rank a diverse set by Bradley-Terry strength, then reveal which region you converged toward (←/→ or swipe; Esc to exit).</li>
-            <li><span className="key-hint">Steer</span> mode — drag a puck across a 2D pad whose axes run between typed word poles; the grid and 3D cloud continuously re-rank toward wherever you steer.</li>
-            <li>Use the control buttons above to navigate your journey.</li>
-          </ul>
-          <p className="text-neutral-500 text-xs">The text model downloads once on your first search, then is cached for instant searches.</p>
-          <p className="text-neutral-500 text-xs">Press anywhere outside to dismiss this panel.</p>
+      <main ref={mainRef} className="main">
+        <div className="context">
+          {query?.kind === "text" ? (
+            <>
+              <span className="meta">Search</span>
+              <span className="context-title">{query.text}</span>
+            </>
+          ) : cluster ? (
+            <>
+              {parent && <span className="meta">{parent.label}</span>}
+              {query?.kind === "image" ? (
+                <button className="context-title context-link" onClick={() => go({ kind: "cluster", index: queryItem!.cluster })}>
+                  {cluster.label}
+                </button>
+              ) : (
+                <span className="context-title">{cluster.label}</span>
+              )}
+              {query?.kind === "image" && queryItem!.tags.length > 0 && (
+                <span className="context-tags">{queryItem!.tags.join(" · ")}</span>
+              )}
+              {query?.kind === "cluster" && <span className="meta">{cluster.size} images</span>}
+            </>
+          ) : null}
         </div>
-      </div>
+        <div className="grid" style={{ height: grid.height }} key={revealKey}>
+          {grid.tiles.map((t) => {
+            const it = items[t.index];
+            return (
+              <TileView
+                key={it.id}
+                item={it}
+                tile={t}
+                isQuery={query?.kind === "image" && it.id === query.id}
+                label={it.tags[0] ?? clusters[it.cluster]?.label ?? ""}
+                onOpen={openImage}
+              />
+            );
+          })}
+        </div>
+      </main>
 
-      {/* Main Justified Grid of absolute positioned elements */}
-      {flatLaidOutItems.map(item => (
-        <ImageCard
-          key={item.id}
-          item={item}
-          onClick={() => handleImageClick(item.id)}
-          onRightClick={(e) => handleImageRightClick(e, item.file)}
-          registerEl={registerGridEl}
-        />
-      ))}
-
-      {/* Converge overlay — mounts on demand, leaves the grid untouched */}
-      {convergeActive && (
-        <Converge items={items} onExit={() => setConvergeActive(false)} />
-      )}
-
-      {/* 3D latent-space navigator — mounts on demand, leaves the grid untouched */}
-      {navigatorActive && (
-        <Navigator3D
+      {cloudOpen && (
+        <Cloud
           items={items}
-          onExit={() => setNavigatorActive(false)}
-          steerChannel={steerChannelRef}
+          clusters={clusters}
+          focusId={queryItem?.id ?? null}
+          onPick={(id) => {
+            setCloudOpen(false);
+            openImage(id);
+          }}
+          onClose={() => setCloudOpen(false)}
         />
       )}
 
-      {/* Steer pad — floats above both views (z-index 300) so the same drag
-          steers whichever one is visible */}
-      {steerActive && (
-        <SteerPad
-          ctx={steerCtx}
-          embedText={embedText}
-          onSteer={handleSteer}
-          onSteerEnd={handleSteerEnd}
-        />
+      {dragging && (
+        <div className="drop-overlay">
+          <p>Drop images or videos to add them to this session</p>
+        </div>
       )}
     </div>
   );
 }
 
-interface ImageCardProps {
-  item: LaidOutItem;
-  onClick: () => void;
-  onRightClick: (e: React.MouseEvent) => void;
-  // Steer mode restyles tiles imperatively; cards opt in by registering their
-  // root element (null on unmount).
-  registerEl?: (id: string, el: HTMLDivElement | null) => void;
+interface TileProps {
+  item: SpaceItem;
+  tile: Tile;
+  isQuery: boolean;
+  label: string;
+  onOpen: (id: string) => void;
 }
 
-const ImageCard: React.FC<ImageCardProps> = React.memo(({ item, onClick, onRightClick, registerEl }) => {
-  const [loaded, setLoaded] = useState(false);
-  const [videoPlaying, setVideoPlaying] = useState(false);
+const TileView = React.memo(function TileView({ item, tile, isQuery, label, onOpen }: TileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const isVideo = item.kind === "video";
-
-  useEffect(() => {
-    let active = true;
-    const img = new Image();
-    img.src = item.thumb;
-
-    if (img.complete) {
-      setLoaded(true);
-    } else {
-      img.decode()
-        .then(() => {
-          if (active) {
-            setLoaded(true);
-          }
-        })
-        .catch(() => {
-          img.onload = () => {
-            if (active) {
-              setLoaded(true);
-            }
-          };
-        });
-    }
-
-    return () => {
-      active = false;
-    };
-  }, [item.thumb]);
-
-  // Hover-to-play: click and right-click are already bound to existing
-  // interactions (hop-to-neighbor, open full-size), so hover is the only
-  // affordance left for video preview — muted/looped, matching the common
-  // silent-preview convention.
-  const handleMouseEnter = () => {
-    if (!isVideo || !videoRef.current) return;
-    videoRef.current.currentTime = 0;
-    videoRef.current.play().catch(() => {});
-    setVideoPlaying(true);
-  };
-  const handleMouseLeave = () => {
-    if (!isVideo || !videoRef.current) return;
-    videoRef.current.pause();
-    setVideoPlaying(false);
-  };
-
   return (
-    <div
-      ref={(el) => registerEl?.(item.id, el)}
-      className="image-item"
-      // Position rides the transform (via --tx/--ty, composed in the
-      // stylesheet) rather than left/top, so reorders animate on the
-      // compositor with zero layout work.
-      style={{
-        "--tx": `${item.left}px`,
-        "--ty": `${item.top}px`,
-        width: `${item.width}px`,
-        height: `${item.height}px`,
-      } as React.CSSProperties}
-      onClick={onClick}
-      onContextMenu={onRightClick}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
+    <button
+      className={`tile${isQuery ? " tile-query" : ""}`}
+      style={
+        {
+          transform: `translate(${tile.x}px, ${tile.y}px)`,
+          width: tile.w,
+          height: tile.h,
+          "--reveal-delay": `${Math.min(tile.rank, REVEAL_MAX_RANK) * REVEAL_STEP_MS}ms`,
+        } as React.CSSProperties
+      }
+      onClick={() => onOpen(item.id)}
+      onMouseEnter={() => {
+        if (isVideo && videoRef.current) videoRef.current.play().catch(() => {});
+      }}
+      onMouseLeave={() => {
+        if (isVideo && videoRef.current) videoRef.current.pause();
+      }}
+      aria-label={item.tags.length > 0 ? item.tags.join(", ") : label}
     >
       {isVideo ? (
-        <>
-          <video
-            ref={videoRef}
-            src={item.file}
-            poster={item.thumb}
-            className={`image-element ${loaded ? "loaded" : ""}`}
-            muted
-            loop
-            playsInline
-            preload="metadata"
-          />
-          {!videoPlaying && (
-            <div className="video-play-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="6 3 20 12 6 21 6 3"></polygon>
-              </svg>
-            </div>
-          )}
-        </>
+        <video ref={videoRef} src={item.file} poster={item.thumb} muted loop playsInline preload="metadata" />
       ) : (
-        <img
-          src={item.thumb}
-          alt=""
-          className={`image-element ${loaded ? "loaded" : ""}`}
-          draggable={false}
-        />
+        <img src={item.thumb} alt="" draggable={false} decoding="async" loading={tile.rank < 24 ? "eager" : "lazy"} />
       )}
-    </div>
+      {label && <span className="tile-label">{label}</span>}
+    </button>
   );
 });
-
-ImageCard.displayName = "ImageCard";

@@ -1,34 +1,33 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# River
 
-## Getting Started
+River shows an image board by visual similarity and by aesthetic.
 
-First, run the development server:
+- In the grid, click an image to see the images most like it. The closest matches come first and are the largest. You can search with words, or add your own images and videos for the session.
+- The cloud shows the board as a 3D cloud of cluster names. Move the cursor over the cloud to see the images under it: the nearest image is full size, and images further away are smaller. Click an image to open its matches in the grid. Drag to rotate and scroll to zoom.
+
+## How similarity works
+
+Each image has two vectors: SigLIP2 base (meaning, also used for text search) and DINOv3 base (visual structure such as layout, material and composition). Each vector is centered on the board's mean, and the two are combined with equal weight. Ranking subtracts a hub penalty (CSLS), so a few average-looking images cannot appear near the top of every result. Exact duplicate pins are removed.
+
+Text search embeds the query in four prompt templates and averages them. It also subtracts a per-image text-hub value, so screenshots full of text do not match every query.
+
+Clusters are two levels of one Ward tree over the combined vectors. Names come from a curated vocabulary (`scripts/vocabulary.ts`), scored zero-shot with the SigLIP2 text model.
+
+## Run
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Rebuild the data
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Put the original images in `public/images`, then run:
 
-## Learn More
+```bash
+npm run precompute
+```
 
-To learn more about Next.js, take a look at the following resources:
+The script makes the thumbnails, the vectors, the 3D layout, the clusters and their names, and writes `src/data/space.json`. Without `public/images`, it rebuilds from the thumbnails that `src/data/space.json` lists. The first run downloads about 1 GB of models. Results are cached in `.cache/precompute`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+In the browser, the first text search downloads the SigLIP2 text model (about 280 MB). The first upload downloads the two vision models (about 180 MB). Both stay cached.
